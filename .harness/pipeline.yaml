@@ -1,0 +1,282 @@
+pipeline:
+  name: deep-agent-harness-pipeline
+  identifier: deep_agent_harness_pipeline
+  projectIdentifier: lobbiai
+  orgIdentifier: default
+  tags: {}
+  properties:
+    ci:
+      codebase:
+        connectorRef: harness_code_lobbiai
+        repoName: ai-deep-template-engine
+        build: <+input>
+  stages:
+    - stage:
+        name: Lint and Test
+        identifier: lint_test
+        type: CI
+        spec:
+          cloneCodebase: true
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: Install Dependencies
+                  identifier: install_deps
+                  spec:
+                    shell: Bash
+                    command: |
+                      python -m pip install --upgrade pip
+                      pip install -e ".[dev]"
+              - step:
+                  type: Run
+                  name: Lint with Ruff
+                  identifier: lint_ruff
+                  spec:
+                    shell: Bash
+                    command: ruff check src/ tests/
+              - step:
+                  type: Run
+                  name: Format Check
+                  identifier: format_check
+                  spec:
+                    shell: Bash
+                    command: black --check src/ tests/
+              - step:
+                  type: Run
+                  name: Run Tests
+                  identifier: run_tests
+                  spec:
+                    shell: Bash
+                    command: pytest --cov=src/deep_agent --cov-report=term --cov-report=xml
+              - step:
+                  type: Run
+                  name: Type Check
+                  identifier: type_check
+                  spec:
+                    shell: Bash
+                    command: mypy src/
+                  failureStrategies:
+                    - onFailure:
+                        errors:
+                          - AllErrors
+                        action:
+                          type: Ignore
+
+    - stage:
+        name: Build Docker Image
+        identifier: build_image
+        type: CI
+        spec:
+          cloneCodebase: true
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: BuildAndPushDockerRegistry
+                  name: Build and Push
+                  identifier: build_push
+                  spec:
+                    connectorRef: docker_hub
+                    repo: thelobbi/deep-agent-harness
+                    tags:
+                      - <+pipeline.sequenceId>
+                      - latest
+                      - <+codebase.commitSha>
+                    dockerfile: Dockerfile
+                    context: .
+                    labels:
+                      version: "0.1.0"
+                      maintainer: "markus@thelobbi.io"
+                      org.opencontainers.image.source: "https://github.com/the-Lobbi/ai-deep-template-engine"
+
+    - stage:
+        name: Security Scan
+        identifier: security_scan
+        type: CI
+        spec:
+          cloneCodebase: false
+          platform:
+            os: Linux
+            arch: Amd64
+          runtime:
+            type: Cloud
+            spec: {}
+          execution:
+            steps:
+              - step:
+                  type: Run
+                  name: Trivy Scan
+                  identifier: trivy_scan
+                  spec:
+                    shell: Bash
+                    command: |
+                      docker run --rm \
+                        aquasec/trivy:latest image \
+                        --severity HIGH,CRITICAL \
+                        --exit-code 1 \
+                        thelobbi/deep-agent-harness:<+pipeline.sequenceId>
+                  failureStrategies:
+                    - onFailure:
+                        errors:
+                          - AllErrors
+                        action:
+                          type: ManualIntervention
+                          spec:
+                            timeout: 1h
+                            onTimeout:
+                              action:
+                                type: MarkAsSuccess
+
+    - stage:
+        name: Deploy to Dev
+        identifier: deploy_dev
+        type: Deployment
+        spec:
+          deploymentType: Kubernetes
+          service:
+            serviceRef: deep_agent_service
+          environment:
+            environmentRef: dev
+            deployToAll: false
+            infrastructureDefinitions:
+              - identifier: k8s_dev_cluster
+          execution:
+            steps:
+              - step:
+                  type: K8sRollingDeploy
+                  name: Rolling Deployment
+                  identifier: rolling_deploy
+                  spec:
+                    skipDryRun: false
+                    pruningEnabled: false
+              - step:
+                  type: K8sApply
+                  name: Apply HPA
+                  identifier: apply_hpa
+                  spec:
+                    filePaths:
+                      - k8s/hpa.yaml
+                    skipDryRun: false
+            rollbackSteps:
+              - step:
+                  type: K8sRollingRollback
+                  name: Rollback Deployment
+                  identifier: rollback_deploy
+                  spec:
+                    pruningEnabled: false
+        tags: {}
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: StageRollback
+
+    - stage:
+        name: Deploy to Staging
+        identifier: deploy_staging
+        type: Deployment
+        spec:
+          deploymentType: Kubernetes
+          service:
+            serviceRef: deep_agent_service
+          environment:
+            environmentRef: staging
+            deployToAll: false
+            infrastructureDefinitions:
+              - identifier: k8s_staging_cluster
+          execution:
+            steps:
+              - step:
+                  type: K8sRollingDeploy
+                  name: Rolling Deployment
+                  identifier: rolling_deploy
+                  spec:
+                    skipDryRun: false
+                    pruningEnabled: false
+            rollbackSteps:
+              - step:
+                  type: K8sRollingRollback
+                  name: Rollback Deployment
+                  identifier: rollback_deploy
+                  spec:
+                    pruningEnabled: false
+        when:
+          pipelineStatus: Success
+          condition: <+pipeline.stages.deploy_dev.status> == "Success"
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: ManualIntervention
+                spec:
+                  timeout: 2h
+                  onTimeout:
+                    action:
+                      type: StageRollback
+
+    - stage:
+        name: Deploy to Prod
+        identifier: deploy_prod
+        type: Deployment
+        spec:
+          deploymentType: Kubernetes
+          service:
+            serviceRef: deep_agent_service
+          environment:
+            environmentRef: prod
+            deployToAll: false
+            infrastructureDefinitions:
+              - identifier: k8s_prod_cluster
+          execution:
+            steps:
+              - step:
+                  type: HarnessApproval
+                  name: Production Approval
+                  identifier: prod_approval
+                  spec:
+                    approvalMessage: Approve deployment to production
+                    includePipelineExecutionHistory: true
+                    approvers:
+                      userGroups:
+                        - production_approvers
+                      minimumCount: 2
+                      disallowPipelineExecutor: true
+                    approverInputs: []
+                  timeout: 24h
+              - step:
+                  type: K8sRollingDeploy
+                  name: Rolling Deployment
+                  identifier: rolling_deploy
+                  spec:
+                    skipDryRun: false
+                    pruningEnabled: false
+            rollbackSteps:
+              - step:
+                  type: K8sRollingRollback
+                  name: Rollback Deployment
+                  identifier: rollback_deploy
+                  spec:
+                    pruningEnabled: false
+        when:
+          pipelineStatus: Success
+          condition: <+pipeline.stages.deploy_staging.status> == "Success"
+        failureStrategies:
+          - onFailure:
+              errors:
+                - AllErrors
+              action:
+                type: StageRollback

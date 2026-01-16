@@ -1,0 +1,139 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: deep-agent-harness
+  labels:
+    app: deep-agent-harness
+    version: v0.1.0
+    component: orchestrator
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: deep-agent-harness
+  template:
+    metadata:
+      labels:
+        app: deep-agent-harness
+        version: v0.1.0
+        component: orchestrator
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8000"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: deep-agent-sa
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: deep-agent
+          image: thelobbi/deep-agent-harness:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8000
+              protocol: TCP
+          env:
+            - name: HARNESS_ACCOUNT_ID
+              valueFrom:
+                secretKeyRef:
+                  name: harness-credentials
+                  key: account_id
+            - name: HARNESS_API_URL
+              valueFrom:
+                configMapKeyRef:
+                  name: deep-agent-config
+                  key: harness_api_url
+            - name: HARNESS_API_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: harness-credentials
+                  key: api_token
+            - name: HARNESS_ORG_IDENTIFIER
+              valueFrom:
+                configMapKeyRef:
+                  name: deep-agent-config
+                  key: org_identifier
+            - name: HARNESS_PROJECT_IDENTIFIER
+              valueFrom:
+                configMapKeyRef:
+                  name: deep-agent-config
+                  key: project_identifier
+            - name: ENABLED_SUBAGENTS
+              valueFrom:
+                configMapKeyRef:
+                  name: deep-agent-config
+                  key: enabled_subagents
+            - name: MCP_SERVER_HOST
+              value: "0.0.0.0"
+            - name: MCP_SERVER_PORT
+              value: "8000"
+            - name: LOG_LEVEL
+              valueFrom:
+                configMapKeyRef:
+                  name: deep-agent-config
+                  key: log_level
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            runAsNonRoot: true
+            runAsUser: 1000
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+            - name: cache
+              mountPath: /.cache
+      volumes:
+        - name: tmp
+          emptyDir: {}
+        - name: cache
+          emptyDir: {}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - deep-agent-harness
+                topologyKey: kubernetes.io/hostname
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
