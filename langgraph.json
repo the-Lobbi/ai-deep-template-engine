@@ -1,6 +1,7 @@
 {
   "dependencies": ["."],
   "graphs": {
+    "connected_graph": "./src/deep_agent/studio_graph_connected.py:app",
     "full_graph": "./src/deep_agent/studio_graph_full.py:app",
     "simple_graph": "./src/deep_agent/studio_graph.py:app"
   },
