@@ -1,7 +1,8 @@
 {
   "dependencies": ["."],
   "graphs": {
-    "studio_graph": "./src/deep_agent/studio_graph.py:app"
+    "full_graph": "./src/deep_agent/studio_graph_full.py:app",
+    "simple_graph": "./src/deep_agent/studio_graph.py:app"
   },
   "env": ".env.example",
   "python_version": "3.12"

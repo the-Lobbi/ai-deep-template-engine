@@ -144,6 +144,13 @@ ENV/
 env.bak/
 venv.bak/
 
+# LangGraph Runtime
+.langgraph_api/
+langgraph.log
+langgraph.pid
+langgraph-dev.log
+nohup.out
+
 # Spyder project settings
 .spyderproject
 .spyproject
