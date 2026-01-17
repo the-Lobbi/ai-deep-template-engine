@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from typing import Any, Callable, Dict, List, Optional, Sequence
 
 
@@ -117,7 +117,7 @@ class AgentRegistry:
     ) -> List[SubagentInvocation]:
         """Create invocation plans for matching subagents."""
         selected = self.select_for_task(requirements)
-        preserved = self.preserve_context(context, {"requirements": requirements})
+        preserved = self.preserve_context(context, {"requirements": asdict(requirements)})
         return [
             SubagentInvocation(name=spec.name, reason=reason, context=preserved)
             for spec in selected
