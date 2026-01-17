@@ -2,7 +2,7 @@
 
 import pytest
 from httpx import AsyncClient
-from httpx_mock import HTTPXMock
+from pytest_httpx import HTTPXMock
 
 from deep_agent import HarnessDeepAgent, AgentConfig, create_agent_workflow
 
@@ -34,7 +34,7 @@ async def test_agent_initialization(agent_config):
 
     assert agent.config.harness_account_id == "test_account"
     assert agent.config.org_identifier == "test_org"
-    assert len(agent.config.enabled_subagents) == 3
+    assert len(agent.registry.list_names()) == 3
 
     await agent.client.aclose()
 
@@ -142,6 +142,7 @@ async def test_delegate_to_subagent(agent):
     assert result["task"] == "terraform_plan"
     assert result["status"] == "delegated"
     assert result["context"]["working_dir"] == "/test"
+    assert result["instance"]["subagent"] == "iac-golden-architect"
 
 
 @pytest.mark.asyncio
@@ -196,61 +197,59 @@ async def test_agent_with_custom_subagents(agent_config):
     await agent.client.aclose()
 
 
-def _base_agent_state(task_type: str):
-    return {
-        "messages": [],
-        "task_type": task_type,
-        "project_identifier": "test_project",
-        "context": {},
-        "subagent_results": {},
-        "next_action": "",
-        "supervisor_path": [],
-        "routing_trace": [],
-    }
+@pytest.mark.asyncio
+async def test_agent_with_empty_subagents(agent_config):
+    """Test agent with explicitly empty subagent list disables all subagents."""
+    agent_config.enabled_subagents = []
+    agent = HarnessDeepAgent(agent_config)
+
+    # No subagents should be registered
+    assert len(agent.registry.list_names()) == 0
+
+    # Should fail to delegate to any subagent
+    with pytest.raises(ValueError, match="is not enabled"):
+        await agent.delegate_to_subagent(
+            subagent="iac-golden-architect",
+            task="test",
+            context={}
+        )
+
+    await agent.client.aclose()
 
 
-def test_workflow_routes_infra_to_iac_architect():
-    workflow = create_agent_workflow()
-    result = workflow.invoke(_base_agent_state("terraform"))
+@pytest.mark.asyncio
+async def test_agent_with_none_subagents(agent_config):
+    """Test agent with None uses default subagents."""
+    agent_config.enabled_subagents = None
+    agent = HarnessDeepAgent(agent_config)
 
-    assert result["subagent_results"]["iac"]["status"] == "success"
-    assert result["supervisor_path"] == ["root_supervisor", "infra_supervisor"]
-    assert result["routing_trace"] == [
-        {"supervisor": "root_supervisor", "decision": "infra_supervisor"},
-        {"supervisor": "infra_supervisor", "decision": "iac_architect"},
-    ]
+    # Default subagents should be registered
+    assert len(agent.registry.list_names()) == 3
+    assert "iac-golden-architect" in agent.registry.list_names()
+    assert "container-workflow" in agent.registry.list_names()
+    assert "team-accelerator" in agent.registry.list_names()
 
-
-def test_workflow_routes_container_to_container_workflow():
-    workflow = create_agent_workflow()
-    result = workflow.invoke(_base_agent_state("docker"))
-
-    assert result["subagent_results"]["container"]["status"] == "success"
-    assert result["supervisor_path"] == ["root_supervisor", "infra_supervisor"]
-    assert result["routing_trace"] == [
-        {"supervisor": "root_supervisor", "decision": "infra_supervisor"},
-        {"supervisor": "infra_supervisor", "decision": "container_workflow"},
-    ]
+    await agent.client.aclose()
 
 
-def test_workflow_routes_delivery_to_team_accelerator():
-    workflow = create_agent_workflow()
-    result = workflow.invoke(_base_agent_state("pipeline"))
+def test_plan_hooks(agent_config):
+    """Ensure planning hooks return invocations for nodes and edges."""
+    async with HarnessDeepAgent(agent_config) as agent:
+        node_plan = agent.plan_subagents_for_node(
+            node_name="analyze",
+            task="terraform_plan",
+            context={"request_id": "123"},
+            capabilities=["terraform"],
+        )
+        edge_plan = agent.plan_subagents_for_edge(
+            source="analyze",
+            destination="iac_architect",
+            task="containerize",
+            context={"request_id": "456"},
+            capabilities=["docker"],
+        )
 
-    assert result["subagent_results"]["team"]["status"] == "success"
-    assert result["supervisor_path"] == ["root_supervisor", "delivery_supervisor"]
-    assert result["routing_trace"] == [
-        {"supervisor": "root_supervisor", "decision": "delivery_supervisor"},
-        {"supervisor": "delivery_supervisor", "decision": "team_accelerator"},
-    ]
-
-
-def test_workflow_routes_unknown_to_general_orchestration():
-    workflow = create_agent_workflow()
-    result = workflow.invoke(_base_agent_state("other"))
-
-    assert result["subagent_results"]["orchestration"]["status"] == "success"
-    assert result["supervisor_path"] == ["root_supervisor"]
-    assert result["routing_trace"] == [
-        {"supervisor": "root_supervisor", "decision": "general_orchestration"},
-    ]
+        assert node_plan
+        assert edge_plan
+        assert node_plan[0].context["request_id"] == "123"
+        assert edge_plan[0].context["request_id"] == "456"

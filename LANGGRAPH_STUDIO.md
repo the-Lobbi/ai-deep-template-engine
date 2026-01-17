@@ -6,23 +6,32 @@ This project is fully configured for visualization and debugging in LangGraph St
 
 ## Quick Start
 
-### 1. Download LangGraph Studio
+### 1. Access LangGraph Studio
 
-Download the desktop application from: **https://studio.langchain.com**
+LangGraph Studio is available as a web-based interface through LangSmith:
 
-Available for:
-- macOS (Apple Silicon & Intel)
-- Linux (AppImage)
-- Windows
+**Web Version (Recommended)**: **https://smith.langchain.com/studio/**
 
-### 2. Open Project in Studio
+**Desktop Application** (macOS only, beta): Available from [GitHub releases](https://github.com/langchain-ai/langgraph-studio/releases)
 
-1. Launch LangGraph Studio
-2. Click **"Open Folder"** or **File → Open Folder**
-3. Navigate to: `/home/markus/ai-deep-template-engine`
-4. Click **"Open"**
+The web version is recommended for most users as it provides better cross-platform support and the latest features without installation.
 
-The application will automatically detect `langgraph.json` and load the workflow graph.
+### 2. Connect to Local LangGraph Server
+
+To use LangGraph Studio with your local project:
+
+1. Start your local LangGraph server:
+   ```bash
+   langgraph dev --no-browser --port 9876
+   ```
+
+2. Open LangGraph Studio Web: **https://smith.langchain.com/studio/**
+
+3. Connect to your local server:
+   - Enter base URL: `http://127.0.0.1:9876`
+   - Click "Connect"
+
+4. The studio will automatically detect `langgraph.json` and load your workflow graphs.
 
 ### 3. Explore the Workflow
 
