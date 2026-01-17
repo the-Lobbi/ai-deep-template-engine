@@ -6,7 +6,7 @@ infrastructure tasks using specialized subagents.
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 import httpx
 
