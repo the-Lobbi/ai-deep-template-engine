@@ -4,7 +4,7 @@ import pytest
 from httpx import AsyncClient
 from httpx_mock import HTTPXMock
 
-from deep_agent import HarnessDeepAgent, AgentConfig
+from deep_agent import HarnessDeepAgent, AgentConfig, create_agent_workflow
 
 
 @pytest.fixture
@@ -194,3 +194,63 @@ async def test_agent_with_custom_subagents(agent_config):
         )
 
     await agent.client.aclose()
+
+
+def _base_agent_state(task_type: str):
+    return {
+        "messages": [],
+        "task_type": task_type,
+        "project_identifier": "test_project",
+        "context": {},
+        "subagent_results": {},
+        "next_action": "",
+        "supervisor_path": [],
+        "routing_trace": [],
+    }
+
+
+def test_workflow_routes_infra_to_iac_architect():
+    workflow = create_agent_workflow()
+    result = workflow.invoke(_base_agent_state("terraform"))
+
+    assert result["subagent_results"]["iac"]["status"] == "success"
+    assert result["supervisor_path"] == ["root_supervisor", "infra_supervisor"]
+    assert result["routing_trace"] == [
+        {"supervisor": "root_supervisor", "decision": "infra_supervisor"},
+        {"supervisor": "infra_supervisor", "decision": "iac_architect"},
+    ]
+
+
+def test_workflow_routes_container_to_container_workflow():
+    workflow = create_agent_workflow()
+    result = workflow.invoke(_base_agent_state("docker"))
+
+    assert result["subagent_results"]["container"]["status"] == "success"
+    assert result["supervisor_path"] == ["root_supervisor", "infra_supervisor"]
+    assert result["routing_trace"] == [
+        {"supervisor": "root_supervisor", "decision": "infra_supervisor"},
+        {"supervisor": "infra_supervisor", "decision": "container_workflow"},
+    ]
+
+
+def test_workflow_routes_delivery_to_team_accelerator():
+    workflow = create_agent_workflow()
+    result = workflow.invoke(_base_agent_state("pipeline"))
+
+    assert result["subagent_results"]["team"]["status"] == "success"
+    assert result["supervisor_path"] == ["root_supervisor", "delivery_supervisor"]
+    assert result["routing_trace"] == [
+        {"supervisor": "root_supervisor", "decision": "delivery_supervisor"},
+        {"supervisor": "delivery_supervisor", "decision": "team_accelerator"},
+    ]
+
+
+def test_workflow_routes_unknown_to_general_orchestration():
+    workflow = create_agent_workflow()
+    result = workflow.invoke(_base_agent_state("other"))
+
+    assert result["subagent_results"]["orchestration"]["status"] == "success"
+    assert result["supervisor_path"] == ["root_supervisor"]
+    assert result["routing_trace"] == [
+        {"supervisor": "root_supervisor", "decision": "general_orchestration"},
+    ]
