@@ -24,7 +24,7 @@ class AgentConfig:
     harness_api_token: str
     org_identifier: str = "default"
     project_identifier: Optional[str] = None
-    enabled_subagents: Sequence[str] = field(
+    enabled_subagents: Optional[Sequence[str]] = field(
         default_factory=lambda: (
             "iac-golden-architect",
             "container-workflow",
@@ -72,8 +72,19 @@ class HarnessDeepAgent:
         )
 
     def _register_default_subagents(self) -> None:
-        """Register baseline subagents, honoring enabled_subagents if provided."""
-        enabled = set(self.config.enabled_subagents or ())
+        """Register baseline subagents, honoring enabled_subagents if provided.
+        
+        - If enabled_subagents is None: register all default subagents
+        - If enabled_subagents is []: register no subagents
+        - If enabled_subagents is ['name']: register only matching subagents
+        """
+        enabled_subagents = self.config.enabled_subagents
+        # Distinguish None (use defaults) from empty list (register none)
+        if enabled_subagents is None:
+            enabled = None
+        else:
+            enabled = set(enabled_subagents)
+        
         default_specs = [
             SubagentSpec(
                 name="iac-golden-architect",
@@ -98,7 +109,7 @@ class HarnessDeepAgent:
             ),
         ]
         for spec in default_specs:
-            if not enabled or spec.name in enabled:
+            if enabled is None or spec.name in enabled:
                 self.registry.register(spec)
 
     async def __aenter__(self) -> "HarnessDeepAgent":
