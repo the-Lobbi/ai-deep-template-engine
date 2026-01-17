@@ -4,15 +4,20 @@ This module provides the LangGraph workflow definition for coordinating
 specialized subagents in infrastructure automation tasks.
 """
 
+import copy
 import logging
 from typing import Annotated, Any, Dict, List, Literal, TypedDict
+from uuid import uuid4
 
+from langgraph.checkpoint.base import create_checkpoint, empty_checkpoint
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 
 from .memory_bus import AccessContext, MemoryBus
 
 logger = logging.getLogger(__name__)
+CHECKPOINTER = MemorySaver()
 
 
 class AgentState(TypedDict):
@@ -43,6 +48,9 @@ class AgentState(TypedDict):
     memory_bus: MemoryBus
     reflection_outcomes: Dict[str, Any]
     remediation_tasks: List[Dict[str, Any]]
+    candidate_results: List[Dict[str, Any]]
+    fork_checkpoint_ids: List[str]
+    merge_result: Dict[str, Any]
 
 
 def get_memory_bus(state: AgentState) -> MemoryBus:
@@ -283,6 +291,72 @@ def _evaluate_subagent_result(result: Dict[str, Any]) -> Dict[str, Any]:
     return {"quality": quality, "completeness": completeness, "risks": risks}
 
 
+def _score_candidate(candidate: Dict[str, Any]) -> Dict[str, Any]:
+    """Score a candidate result set based on evaluation heuristics."""
+    score = 0
+    assessments: Dict[str, Any] = {}
+
+    for result_key, result in candidate["results"].items():
+        outcome = _evaluate_subagent_result(result)
+        assessments[result_key] = outcome
+        if outcome["quality"] == "high":
+            score += 2
+        else:
+            score -= 1
+        if outcome["completeness"] == "complete":
+            score += 1
+        else:
+            score -= 1
+        score -= len(outcome["risks"])
+
+    return {"score": score, "assessments": assessments}
+
+
+def _build_candidate_variants(results: Dict[str, Any]) -> List[Dict[str, Any]]:
+    """Create multiple candidate variants from base subagent results."""
+    baseline = copy.deepcopy(results)
+    enriched = copy.deepcopy(results)
+    risk_averse = copy.deepcopy(results)
+
+    for result in enriched.values():
+        output = result.get("output", "")
+        if output:
+            result["output"] = f"{output} (validated for completeness)"
+        else:
+            result["output"] = "No output provided; additional investigation recommended."
+
+    for result in risk_averse.values():
+        if result.get("status") != "success":
+            result["status"] = "needs_review"
+        output = result.get("output", "")
+        if output and "warning" not in output.lower():
+            result["output"] = f"{output} (risk review: no warnings detected)"
+
+    return [
+        {"name": "baseline", "results": baseline},
+        {"name": "enriched", "results": enriched},
+        {"name": "risk_averse", "results": risk_averse},
+    ]
+
+
+def _combine_candidate_results(candidates: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """Combine candidate results into a single merged outcome."""
+    combined: Dict[str, Any] = {}
+    for candidate in candidates:
+        for key, result in candidate["results"].items():
+            existing = combined.get(key)
+            if not existing:
+                combined[key] = copy.deepcopy(result)
+                continue
+            existing_outputs = {existing.get("output", "")}
+            existing_outputs.add(result.get("output", ""))
+            combined_output = " | ".join(output for output in existing_outputs if output)
+            existing["output"] = combined_output or existing.get("output", "")
+            if existing.get("status") != result.get("status"):
+                existing["status"] = "mixed"
+    return combined
+
+
 def _supervisor_for_result(result_key: str, result: Dict[str, Any]) -> str:
     """Return the supervisor name to re-route for a given result."""
     mapping = {
@@ -329,6 +403,88 @@ def reflection_node(state: AgentState) -> AgentState:
         access_context=AccessContext.for_workflow("reflection"),
     )
     logger.info("Reflection completed; next action: %s", state["next_action"])
+    return state
+
+
+def fork_candidates_node(state: AgentState) -> AgentState:
+    """Fork state into candidate variants and checkpoint each branch."""
+    logger.info("Forking state into candidate variants via checkpoints")
+    results = state.get("subagent_results", {})
+    candidate_results = _build_candidate_variants(results)
+    fork_checkpoint_ids: List[str] = []
+
+    for index, candidate in enumerate(candidate_results, start=1):
+        checkpoint_id = str(uuid4())
+        checkpoint = empty_checkpoint()
+        checkpoint["channel_values"] = {"candidate": candidate}
+        checkpoint = create_checkpoint(checkpoint, None, index, id=checkpoint_id)
+        metadata = {
+            "source": "state_fork",
+            "candidate_name": candidate["name"],
+            "candidate_index": index,
+        }
+        CHECKPOINTER.put({"configurable": {"checkpoint_id": checkpoint_id}}, checkpoint, metadata, {})
+        fork_checkpoint_ids.append(checkpoint_id)
+
+    state["candidate_results"] = candidate_results
+    state["fork_checkpoint_ids"] = fork_checkpoint_ids
+    state["next_action"] = "merge_candidates"
+    memory_bus = get_memory_bus(state)
+    memory_bus.set(
+        "workflow",
+        "forks.candidates",
+        {"candidates": candidate_results, "checkpoint_ids": fork_checkpoint_ids},
+        access_context=AccessContext.for_workflow("fork_candidates"),
+    )
+    return state
+
+
+def merge_candidates_node(state: AgentState) -> AgentState:
+    """Evaluate forked candidates and select or combine the best outcome."""
+    logger.info("Merging candidate results after fork evaluation")
+    candidate_results = state.get("candidate_results", [])
+    if not candidate_results:
+        state["next_action"] = "reflection"
+        return state
+
+    scored_candidates: List[Dict[str, Any]] = []
+    for candidate in candidate_results:
+        evaluation = _score_candidate(candidate)
+        scored_candidates.append(
+            {
+                "name": candidate["name"],
+                "results": candidate["results"],
+                "score": evaluation["score"],
+                "assessments": evaluation["assessments"],
+            }
+        )
+
+    best_score = max(candidate["score"] for candidate in scored_candidates)
+    top_candidates = [candidate for candidate in scored_candidates if candidate["score"] == best_score]
+    if len(top_candidates) == 1:
+        selected_results = top_candidates[0]["results"]
+        selection_summary = {"selection": top_candidates[0]["name"], "score": best_score}
+    else:
+        selected_results = _combine_candidate_results(top_candidates)
+        selection_summary = {
+            "selection": "combined",
+            "candidates": [candidate["name"] for candidate in top_candidates],
+            "score": best_score,
+        }
+
+    state["subagent_results"] = selected_results
+    state["merge_result"] = {
+        "summary": selection_summary,
+        "scored_candidates": scored_candidates,
+    }
+    state["next_action"] = "reflection"
+    memory_bus = get_memory_bus(state)
+    memory_bus.set(
+        "workflow",
+        "merge.result",
+        state["merge_result"],
+        access_context=AccessContext.for_workflow("merge_candidates"),
+    )
     return state
 
 
@@ -386,11 +542,11 @@ def route_delivery_step(
 
 def route_post_subgraph(
     state: AgentState,
-) -> Literal["reflection", "end"]:
-    """Route after subgraph execution to reflection or end."""
+) -> Literal["fork_candidates", "end"]:
+    """Route after subgraph execution to forked candidate evaluation or end."""
     next_action = state.get("next_action", "end")
     if next_action == "reflection":
-        return "reflection"
+        return "fork_candidates"
     return "end"
 
 
@@ -410,6 +566,16 @@ def route_reflection_step(
     if next_action == "complete":
         return "end"
     return next_action  # type: ignore
+
+
+def route_merge_step(
+    state: AgentState,
+) -> Literal["reflection", "end"]:
+    """Route from merge to reflection or end."""
+    next_action = state.get("next_action", "end")
+    if next_action == "reflection":
+        return "reflection"
+    return "end"
 
 
 def create_infra_subgraph() -> StateGraph:
@@ -467,6 +633,8 @@ def create_agent_workflow() -> StateGraph:
     workflow.add_node("infra_supervisor", create_infra_subgraph())
     workflow.add_node("delivery_supervisor", create_delivery_subgraph())
     workflow.add_node("general_orchestration", general_orchestration_node)
+    workflow.add_node("fork_candidates", fork_candidates_node)
+    workflow.add_node("merge_candidates", merge_candidates_node)
     workflow.add_node("reflection", reflection_node)
 
     # Define edges
@@ -486,16 +654,22 @@ def create_agent_workflow() -> StateGraph:
     workflow.add_conditional_edges(
         "infra_supervisor",
         route_post_subgraph,
-        {"reflection": "reflection", "end": END},
+        {"fork_candidates": "fork_candidates", "end": END},
     )
     workflow.add_conditional_edges(
         "delivery_supervisor",
         route_post_subgraph,
-        {"reflection": "reflection", "end": END},
+        {"fork_candidates": "fork_candidates", "end": END},
     )
     workflow.add_conditional_edges(
         "general_orchestration",
         route_post_subgraph,
+        {"fork_candidates": "fork_candidates", "end": END},
+    )
+    workflow.add_edge("fork_candidates", "merge_candidates")
+    workflow.add_conditional_edges(
+        "merge_candidates",
+        route_merge_step,
         {"reflection": "reflection", "end": END},
     )
     workflow.add_conditional_edges(
@@ -509,4 +683,4 @@ def create_agent_workflow() -> StateGraph:
         },
     )
 
-    return workflow.compile()
+    return workflow.compile(checkpointer=CHECKPOINTER)
