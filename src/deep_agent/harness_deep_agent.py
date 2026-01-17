@@ -6,9 +6,11 @@ infrastructure tasks using specialized subagents.
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import httpx
+
+from .agent_registry import AgentRegistry, SubagentSpec, TaskRequirements, default_subagent_factory
 
 logger = logging.getLogger(__name__)
 
@@ -22,12 +24,12 @@ class AgentConfig:
     harness_api_token: str
     org_identifier: str = "default"
     project_identifier: Optional[str] = None
-    enabled_subagents: List[str] = field(
-        default_factory=lambda: [
+    enabled_subagents: Sequence[str] = field(
+        default_factory=lambda: (
             "iac-golden-architect",
             "container-workflow",
             "team-accelerator",
-        ]
+        )
     )
     mcp_server_host: str = "0.0.0.0"
     mcp_server_port: int = 8000
@@ -53,6 +55,8 @@ class HarnessDeepAgent:
             config: Agent configuration with Harness credentials
         """
         self.config = config
+        self.registry = AgentRegistry()
+        self._register_default_subagents()
         self.client = httpx.AsyncClient(
             base_url=config.harness_api_url,
             headers={
@@ -62,7 +66,40 @@ class HarnessDeepAgent:
             timeout=30.0,
         )
         logging.basicConfig(level=config.log_level)
-        logger.info(f"Initialized HarnessDeepAgent with subagents: {config.enabled_subagents}")
+        logger.info(
+            "Initialized HarnessDeepAgent with subagents: %s",
+            ", ".join(self.registry.list_names()),
+        )
+
+    def _register_default_subagents(self) -> None:
+        """Register baseline subagents, honoring enabled_subagents if provided."""
+        enabled = set(self.config.enabled_subagents or ())
+        default_specs = [
+            SubagentSpec(
+                name="iac-golden-architect",
+                description="Infrastructure as code planning and Terraform guidance.",
+                capabilities=("terraform", "iac", "planning"),
+                supported_tasks=("terraform_plan", "iac_design", "iac_review"),
+                factory=default_subagent_factory("iac-golden-architect"),
+            ),
+            SubagentSpec(
+                name="container-workflow",
+                description="Container build, packaging, and deployment workflows.",
+                capabilities=("docker", "containers", "build"),
+                supported_tasks=("containerize", "docker_build", "image_scan"),
+                factory=default_subagent_factory("container-workflow"),
+            ),
+            SubagentSpec(
+                name="team-accelerator",
+                description="Repository setup and pipeline automation.",
+                capabilities=("repositories", "pipelines", "harness"),
+                supported_tasks=("repo_setup", "pipeline_create", "ci_bootstrap"),
+                factory=default_subagent_factory("team-accelerator"),
+            ),
+        ]
+        for spec in default_specs:
+            if not enabled or spec.name in enabled:
+                self.registry.register(spec)
 
     async def __aenter__(self):
         """Async context manager entry."""
@@ -175,19 +212,40 @@ class HarnessDeepAgent:
         Returns:
             Subagent execution result
         """
-        if subagent not in self.config.enabled_subagents:
+        if not self.registry.get(subagent):
             raise ValueError(f"Subagent '{subagent}' is not enabled")
 
         logger.info(f"Delegating to {subagent}: {task}")
 
         # This is a placeholder for actual subagent delegation
         # In production, this would route to LangGraph workflow nodes
+        agent_instance = self.registry.instantiate(subagent, context)
         return {
             "subagent": subagent,
             "task": task,
             "status": "delegated",
             "context": context,
+            "instance": agent_instance,
         }
+
+    def plan_subagents_for_node(
+        self, node_name: str, task: str, context: Dict[str, Any], capabilities: Sequence[str]
+    ):
+        """Plan subagent invocations when approaching a workflow node."""
+        requirements = TaskRequirements(task=task, capabilities=capabilities, allow_team=True)
+        return self.registry.plan_for_node(node_name, requirements, context)
+
+    def plan_subagents_for_edge(
+        self,
+        source: str,
+        destination: str,
+        task: str,
+        context: Dict[str, Any],
+        capabilities: Sequence[str],
+    ):
+        """Plan subagent invocations when approaching a workflow edge."""
+        requirements = TaskRequirements(task=task, capabilities=capabilities, allow_team=True)
+        return self.registry.plan_for_edge(source, destination, requirements, context)
 
     async def health_check(self) -> Dict[str, str]:
         """Check health of the agent and Harness API connectivity.

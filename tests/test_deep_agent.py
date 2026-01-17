@@ -34,7 +34,7 @@ async def test_agent_initialization(agent_config):
 
     assert agent.config.harness_account_id == "test_account"
     assert agent.config.org_identifier == "test_org"
-    assert len(agent.config.enabled_subagents) == 3
+    assert len(agent.registry.list_names()) == 3
 
     await agent.client.aclose()
 
@@ -142,6 +142,7 @@ async def test_delegate_to_subagent(agent):
     assert result["task"] == "terraform_plan"
     assert result["status"] == "delegated"
     assert result["context"]["working_dir"] == "/test"
+    assert result["instance"]["subagent"] == "iac-golden-architect"
 
 
 @pytest.mark.asyncio
@@ -194,3 +195,26 @@ async def test_agent_with_custom_subagents(agent_config):
         )
 
     await agent.client.aclose()
+
+
+def test_plan_hooks(agent_config):
+    """Ensure planning hooks return invocations for nodes and edges."""
+    agent = HarnessDeepAgent(agent_config)
+    node_plan = agent.plan_subagents_for_node(
+        node_name="analyze",
+        task="terraform_plan",
+        context={"request_id": "123"},
+        capabilities=["terraform"],
+    )
+    edge_plan = agent.plan_subagents_for_edge(
+        source="analyze",
+        destination="iac_architect",
+        task="containerize",
+        context={"request_id": "456"},
+        capabilities=["docker"],
+    )
+
+    assert node_plan
+    assert edge_plan
+    assert node_plan[0].context["request_id"] == "123"
+    assert edge_plan[0].context["request_id"] == "456"
