@@ -10,8 +10,15 @@ from typing import Any, Dict, List, Optional, Sequence, Type, cast
 
 import httpx
 
-from .agent_registry import AgentRegistry, SubagentInvocation, SubagentSpec, TaskRequirements, default_subagent_factory
-from .memory_bus import AccessContext, InMemoryMemoryBackend, MemoryBackend, MemoryBus
+from .agent_registry import (
+    AgentRegistry,
+    SubagentInvocation,
+    SubagentSpec,
+    TaskRequirements,
+    default_subagent_factory,
+)
+from .memory_bus import AccessContext, MemoryBus, MemoryBackend, InMemoryMemoryBackend
+from .tool_cache import ToolCache
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +43,7 @@ class AgentConfig:
     mcp_server_port: int = 8000
     log_level: str = "INFO"
     memory_backend: Optional[MemoryBackend] = None
+    tool_cache_ttl_seconds: float = 300.0
 
 
 class HarnessDeepAgent:
@@ -69,6 +77,7 @@ class HarnessDeepAgent:
         )
         self.memory_bus = MemoryBus(config.memory_backend or InMemoryMemoryBackend())
         self.memory_access = AccessContext.for_agent("harness_deep_agent")
+        self.tool_cache = ToolCache(ttl_seconds=config.tool_cache_ttl_seconds)
         logging.basicConfig(level=config.log_level)
         logger.info(
             "Initialized HarnessDeepAgent with subagents: %s",
@@ -244,16 +253,28 @@ class HarnessDeepAgent:
             access_context=self.memory_access,
         )
 
+        tool_inputs = {"task": task, "context": context}
+        cache_namespace = self.tool_cache.build_namespace("delegate_to_subagent", subagent)
+        cache_key = self.tool_cache.build_cache_key(tool_inputs)
+        if self.tool_cache.ttl_seconds > 0:
+            cached = self.tool_cache.get(cache_namespace, cache_key)
+            if cached is not None:
+                logger.info("Cache hit for %s:%s", cache_namespace, cache_key)
+                return cached
+
         # This is a placeholder for actual subagent delegation
         # In production, this would route to LangGraph workflow nodes
         agent_instance = self.registry.instantiate(subagent, context)
-        return {
+        result = {
             "subagent": subagent,
             "task": task,
             "status": "delegated",
             "context": context,
             "instance": agent_instance,
         }
+        if self.tool_cache.ttl_seconds > 0:
+            self.tool_cache.set(cache_namespace, cache_key, result)
+        return result
 
     def plan_subagents_for_node(
         self, node_name: str, task: str, context: Dict[str, Any], capabilities: Sequence[str]

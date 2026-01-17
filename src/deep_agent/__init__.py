@@ -9,6 +9,7 @@ from .agent_registry import AgentRegistry, SubagentSpec, TaskRequirements
 from .harness_deep_agent import HarnessDeepAgent, AgentConfig
 from .langgraph_integration import create_agent_workflow, AgentState
 from .memory_bus import AccessContext, MemoryBus, MemoryBackend, InMemoryMemoryBackend
+from .tool_cache import ToolCache
 
 __all__ = [
     "HarnessDeepAgent",
@@ -22,4 +23,5 @@ __all__ = [
     "MemoryBus",
     "MemoryBackend",
     "InMemoryMemoryBackend",
+    "ToolCache",
 ]
