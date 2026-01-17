@@ -84,10 +84,11 @@ class AgentRegistry:
         matches = self.discover(requirements)
         if not matches:
             return []
-        ranked = sorted(matches, key=lambda spec: spec.match_score(requirements), reverse=True)
+        scored = [(spec, spec.match_score(requirements)) for spec in matches]
+        ranked = sorted(scored, key=lambda item: item[1], reverse=True)
         if requirements.allow_team:
-            return [spec for spec in ranked if spec.match_score(requirements) > 0]
-        return [ranked[0]]
+            return [spec for spec, score in ranked if score > 0]
+        return [ranked[0][0]]
 
     def instantiate(self, name: str, context: Dict[str, Any]) -> Any:
         """Instantiate a subagent by name."""
