@@ -231,7 +231,38 @@ class HarnessDeepAgent:
     def plan_subagents_for_node(
         self, node_name: str, task: str, context: Dict[str, Any], capabilities: Sequence[str]
     ):
-        """Plan subagent invocations when approaching a workflow node."""
+        """Plan subagent invocations when approaching a workflow node.
+
+        This hook is typically called by the workflow engine (for example,
+        a LangGraph node) immediately before executing a specific node so
+        that the appropriate subagents can be scheduled.
+
+        Args:
+            node_name: Logical name or identifier of the workflow/LangGraph
+                node that is about to be executed.
+            task: Natural-language description of the work to perform at
+                this node (e.g., "provision QA environment").
+            context: Shared task context and parameters passed between
+                nodes (such as repository info, environment details, or
+                previous results).
+            capabilities: Capabilities that candidate subagents must
+                support for this node (for example, ["git", "terraform"]).
+
+        Returns:
+            List of SubagentInvocation objects describing which subagents
+            should be invoked for this node, in what order, and with what
+            configuration.
+
+        Example:
+            invocations = agent.plan_subagents_for_node(
+                node_name="provision_infra",
+                task="Create a new QA environment",
+                context=current_context,
+                capabilities=["terraform", "cloud"],
+            )
+            # The returned list can then be used by the workflow engine to
+            # dispatch work to each selected subagent.
+        """
         requirements = TaskRequirements(task=task, capabilities=capabilities, allow_team=True)
         return self.registry.plan_for_node(node_name, requirements, context)
 
