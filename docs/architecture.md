@@ -28,7 +28,9 @@ Provides declarative workflow orchestration with:
 - **Observability**: Built-in tracing and logging via LangSmith (optional)
 
 **Workflow Nodes:**
-- `analyze_task`: Parse task type and determine routing strategy
+- `root_supervisor_node`: Top-level router for infra vs delivery workflows
+- `infra_supervisor_node`: Subgraph supervisor for IaC and container workflows
+- `delivery_supervisor_node`: Subgraph supervisor for delivery acceleration
 - `iac_architect_node`: Execute Terraform and IaC operations
 - `container_workflow_node`: Handle Docker and container tasks
 - `team_accelerator_node`: Manage repository and pipeline creation
@@ -87,27 +89,44 @@ User Request
      │
      ↓
 ┌─────────────────┐
-│  Analyze Task   │ → Determine task_type
-│  (Entry Point)  │   Extract context
+│ Root Supervisor │ → Determine top-level domain
+│  (Entry Point)  │   Record routing trace
 └─────────────────┘
      │
      ↓
+┌────────────────────┐
+│ Infra Supervisor   │ → terraform/iac → iac_architect
+│ (Subgraph)         │   docker/container → container_workflow
+└────────────────────┘
+     │
+     │
+     ├────────────────────┐
+     │ Delivery Supervisor│ → repository/pipeline → team_accelerator
+     │ (Subgraph)         │
+     └────────────────────┘
+     │
+     ↓
 ┌─────────────────┐
-│ Route to        │
-│ Subagent        │ → Based on task_type:
-└─────────────────┘   • terraform → iac_architect
-     │                • docker → container_workflow
-     ↓                • repository → team_accelerator
-┌─────────────────┐
-│ Execute         │
-│ Subagent Node   │ → Delegate to specialized agent
-└─────────────────┘   Run agent-specific operations
+│ Execute         │ → Delegate to specialized agent
+│ Subagent Node   │   Run agent-specific operations
+└─────────────────┘
      │
      ↓
 ┌─────────────────┐
 │ Complete        │ → Return results
 │ (END)           │   Update state
 └─────────────────┘
+```
+
+### Supervisor Hierarchy
+
+```
+root_supervisor
+├─ infra_supervisor
+│  ├─ iac_architect
+│  └─ container_workflow
+└─ delivery_supervisor
+   └─ team_accelerator
 ```
 
 ### State Transitions
@@ -121,7 +140,12 @@ The `AgentState` TypedDict maintains workflow context:
     "project_identifier": "lobbiai",      # Harness project
     "context": {...},                     # Task-specific params
     "subagent_results": {...},            # Execution results
-    "next_action": "iac_architect"        # Next workflow step
+    "next_action": "infra_supervisor",    # Next workflow step
+    "supervisor_path": ["root_supervisor", "infra_supervisor"],
+    "routing_trace": [
+        {"supervisor": "root_supervisor", "decision": "infra_supervisor"},
+        {"supervisor": "infra_supervisor", "decision": "iac_architect"}
+    ]
 }
 ```
 
@@ -229,7 +253,7 @@ HTTP endpoints:
 
 1. Add subagent identifier to `AgentConfig.enabled_subagents`
 2. Create workflow node function in `langgraph_integration.py`
-3. Add routing logic in `route_next_step()`
+3. Add routing logic in the appropriate supervisor router (e.g., `route_root_step`)
 4. Implement subagent-specific operations
 5. Update documentation
 

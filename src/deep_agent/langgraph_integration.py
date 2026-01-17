@@ -23,6 +23,8 @@ class AgentState(TypedDict):
         context: Additional task context
         subagent_results: Results from subagent executions
         next_action: Next action to take in workflow
+        supervisor_path: Ordered supervisors that handled routing
+        routing_trace: Routing decisions for multi-level supervisors
     """
 
     messages: Annotated[List[Dict[str, Any]], add_messages]
@@ -31,10 +33,20 @@ class AgentState(TypedDict):
     context: Dict[str, Any]
     subagent_results: Dict[str, Any]
     next_action: str
+    supervisor_path: List[str]
+    routing_trace: List[Dict[str, str]]
 
 
-def analyze_task(state: AgentState) -> AgentState:
-    """Analyze the incoming task and determine routing.
+def record_supervisor_decision(state: AgentState, supervisor: str, decision: str) -> None:
+    """Record a routing decision for multi-level supervisors."""
+    state.setdefault("supervisor_path", [])
+    state.setdefault("routing_trace", [])
+    state["supervisor_path"].append(supervisor)
+    state["routing_trace"].append({"supervisor": supervisor, "decision": decision})
+
+
+def root_supervisor_node(state: AgentState) -> AgentState:
+    """Analyze the incoming task and determine top-level routing.
 
     Args:
         state: Current agent state
@@ -43,19 +55,41 @@ def analyze_task(state: AgentState) -> AgentState:
         Updated state with next_action
     """
     task_type = state["task_type"]
-    logger.info(f"Analyzing task type: {task_type}")
+    logger.info("Root supervisor analyzing task type: %s", task_type)
 
-    # Route based on task type
+    if task_type in ["terraform", "iac", "infrastructure", "docker", "container", "dockerfile"]:
+        state["next_action"] = "infra_supervisor"
+    elif task_type in ["repository", "pipeline", "deployment"]:
+        state["next_action"] = "delivery_supervisor"
+    else:
+        state["next_action"] = "general_orchestration"
+
+    record_supervisor_decision(state, "root_supervisor", state["next_action"])
+    logger.info("Root supervisor routing to: %s", state["next_action"])
+    return state
+
+
+def infra_supervisor_node(state: AgentState) -> AgentState:
+    """Route infrastructure tasks to the correct infra subagent.
+
+    Args:
+        state: Current agent state
+
+    Returns:
+        Updated state with next_action
+    """
+    task_type = state["task_type"]
+    logger.info("Infra supervisor analyzing task type: %s", task_type)
+
     if task_type in ["terraform", "iac", "infrastructure"]:
         state["next_action"] = "iac_architect"
     elif task_type in ["docker", "container", "dockerfile"]:
         state["next_action"] = "container_workflow"
-    elif task_type in ["repository", "pipeline", "deployment"]:
-        state["next_action"] = "team_accelerator"
     else:
-        state["next_action"] = "general_orchestration"
+        state["next_action"] = "end"
 
-    logger.info(f"Routing to: {state['next_action']}")
+    record_supervisor_decision(state, "infra_supervisor", state["next_action"])
+    logger.info("Infra supervisor routing to: %s", state["next_action"])
     return state
 
 
@@ -80,6 +114,7 @@ def iac_architect_node(state: AgentState) -> AgentState:
         "output": "Infrastructure plan generated successfully",
     }
 
+    state.setdefault("subagent_results", {})
     state["subagent_results"]["iac"] = result
     state["next_action"] = "complete"
     return state
@@ -106,6 +141,7 @@ def container_workflow_node(state: AgentState) -> AgentState:
         "output": "Dockerfile validated and optimized",
     }
 
+    state.setdefault("subagent_results", {})
     state["subagent_results"]["container"] = result
     state["next_action"] = "complete"
     return state
@@ -132,6 +168,7 @@ def team_accelerator_node(state: AgentState) -> AgentState:
         "output": "Repository and pipeline configured",
     }
 
+    state.setdefault("subagent_results", {})
     state["subagent_results"]["team"] = result
     state["next_action"] = "complete"
     return state
@@ -157,28 +194,105 @@ def general_orchestration_node(state: AgentState) -> AgentState:
         "output": "Task coordinated across subagents",
     }
 
+    state.setdefault("subagent_results", {})
     state["subagent_results"]["orchestration"] = result
     state["next_action"] = "complete"
     return state
 
 
-def route_next_step(
-    state: AgentState,
-) -> Literal["iac_architect", "container_workflow", "team_accelerator", "general_orchestration", "end"]:
-    """Route to the next workflow step based on state.
+def delivery_supervisor_node(state: AgentState) -> AgentState:
+    """Route delivery tasks to the delivery subagent.
 
     Args:
         state: Current agent state
 
     Returns:
-        Next node to execute
+        Updated state with next_action
     """
-    next_action = state.get("next_action", "end")
+    state["next_action"] = "team_accelerator"
+    record_supervisor_decision(state, "delivery_supervisor", state["next_action"])
+    logger.info("Delivery supervisor routing to: %s", state["next_action"])
+    return state
 
+
+def route_root_step(
+    state: AgentState,
+) -> Literal["infra_supervisor", "delivery_supervisor", "general_orchestration", "end"]:
+    """Route to the next workflow step based on state."""
+    next_action = state.get("next_action", "end")
     if next_action == "complete":
         return "end"
-
     return next_action  # type: ignore
+
+
+def route_infra_step(
+    state: AgentState,
+) -> Literal["iac_architect", "container_workflow", "end"]:
+    """Route within the infra subgraph."""
+    next_action = state.get("next_action", "end")
+    if next_action == "complete":
+        return "end"
+    return next_action  # type: ignore
+
+
+def route_delivery_step(
+    state: AgentState,
+) -> Literal["team_accelerator", "end"]:
+    """Route within the delivery subgraph."""
+    next_action = state.get("next_action", "end")
+    if next_action == "complete":
+        return "end"
+    return next_action  # type: ignore
+
+
+def route_to_end(state: AgentState) -> Literal["end"]:
+    """Route leaf nodes to the end state."""
+    next_action = state.get("next_action", "end")
+    if next_action == "complete":
+        return "end"
+    return "end"
+
+
+def create_infra_subgraph() -> StateGraph:
+    """Create the infra supervisor subgraph."""
+    infra_graph = StateGraph(AgentState)
+
+    infra_graph.add_node("infra_supervisor", infra_supervisor_node)
+    infra_graph.add_node("iac_architect", iac_architect_node)
+    infra_graph.add_node("container_workflow", container_workflow_node)
+
+    infra_graph.set_entry_point("infra_supervisor")
+    infra_graph.add_conditional_edges(
+        "infra_supervisor",
+        route_infra_step,
+        {
+            "iac_architect": "iac_architect",
+            "container_workflow": "container_workflow",
+            "end": END,
+        },
+    )
+    infra_graph.add_conditional_edges("iac_architect", route_to_end, {"end": END})
+    infra_graph.add_conditional_edges("container_workflow", route_to_end, {"end": END})
+
+    return infra_graph.compile()
+
+
+def create_delivery_subgraph() -> StateGraph:
+    """Create the delivery supervisor subgraph."""
+    delivery_graph = StateGraph(AgentState)
+
+    delivery_graph.add_node("delivery_supervisor", delivery_supervisor_node)
+    delivery_graph.add_node("team_accelerator", team_accelerator_node)
+
+    delivery_graph.set_entry_point("delivery_supervisor")
+    delivery_graph.add_conditional_edges(
+        "delivery_supervisor",
+        route_delivery_step,
+        {"team_accelerator": "team_accelerator", "end": END},
+    )
+    delivery_graph.add_conditional_edges("team_accelerator", route_to_end, {"end": END})
+
+    return delivery_graph.compile()
 
 
 def create_agent_workflow() -> StateGraph:
@@ -190,31 +304,27 @@ def create_agent_workflow() -> StateGraph:
     workflow = StateGraph(AgentState)
 
     # Add nodes
-    workflow.add_node("analyze", analyze_task)
-    workflow.add_node("iac_architect", iac_architect_node)
-    workflow.add_node("container_workflow", container_workflow_node)
-    workflow.add_node("team_accelerator", team_accelerator_node)
+    workflow.add_node("root_supervisor", root_supervisor_node)
+    workflow.add_node("infra_supervisor", create_infra_subgraph())
+    workflow.add_node("delivery_supervisor", create_delivery_subgraph())
     workflow.add_node("general_orchestration", general_orchestration_node)
 
     # Define edges
-    workflow.set_entry_point("analyze")
+    workflow.set_entry_point("root_supervisor")
 
     workflow.add_conditional_edges(
-        "analyze",
-        route_next_step,
+        "root_supervisor",
+        route_root_step,
         {
-            "iac_architect": "iac_architect",
-            "container_workflow": "container_workflow",
-            "team_accelerator": "team_accelerator",
+            "infra_supervisor": "infra_supervisor",
+            "delivery_supervisor": "delivery_supervisor",
             "general_orchestration": "general_orchestration",
             "end": END,
         },
     )
 
-    # All subagent nodes route to end
-    workflow.add_conditional_edges("iac_architect", route_next_step, {"end": END})
-    workflow.add_conditional_edges("container_workflow", route_next_step, {"end": END})
-    workflow.add_conditional_edges("team_accelerator", route_next_step, {"end": END})
-    workflow.add_conditional_edges("general_orchestration", route_next_step, {"end": END})
+    workflow.add_conditional_edges("infra_supervisor", route_to_end, {"end": END})
+    workflow.add_conditional_edges("delivery_supervisor", route_to_end, {"end": END})
+    workflow.add_conditional_edges("general_orchestration", route_to_end, {"end": END})
 
     return workflow.compile()
