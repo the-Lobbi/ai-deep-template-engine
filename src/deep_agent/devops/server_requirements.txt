@@ -1,0 +1,25 @@
+# Requirements for DevOps Multi-Agent API Server
+
+# Core dependencies
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+python-multipart>=0.0.6
+
+# Logging
+structlog>=23.2.0
+
+# LangChain dependencies
+langchain>=0.1.0
+langchain-anthropic>=0.1.0
+langchain-core>=0.1.0
+langgraph>=0.0.40
+
+# Optional dependencies
+pinecone-client>=2.2.0  # For RAG functionality
+requests>=2.31.0  # For client examples
+
+# Development dependencies
+pytest>=7.4.0
+pytest-asyncio>=0.21.0
+httpx>=0.25.0  # For async testing
