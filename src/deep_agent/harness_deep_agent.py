@@ -6,11 +6,11 @@ infrastructure tasks using specialized subagents.
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Type, cast
 
 import httpx
 
-from .agent_registry import AgentRegistry, SubagentSpec, TaskRequirements, default_subagent_factory
+from .agent_registry import AgentRegistry, SubagentInvocation, SubagentSpec, TaskRequirements, default_subagent_factory
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +48,7 @@ class HarnessDeepAgent:
         client: HTTP client for Harness API calls
     """
 
-    def __init__(self, config: AgentConfig):
+    def __init__(self, config: AgentConfig) -> None:
         """Initialize the Deep Agent.
 
         Args:
@@ -101,11 +101,16 @@ class HarnessDeepAgent:
             if not enabled or spec.name in enabled:
                 self.registry.register(spec)
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> "HarnessDeepAgent":
         """Async context manager entry."""
         return self
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
+    async def __aexit__(
+        self,
+        exc_type: Optional[Type[BaseException]],
+        exc_val: Optional[BaseException],
+        exc_tb: Optional[Any],
+    ) -> None:
         """Async context manager exit."""
         await self.client.aclose()
 
@@ -140,7 +145,7 @@ class HarnessDeepAgent:
         response = await self.client.post(url, json=payload)
         response.raise_for_status()
 
-        result = response.json()
+        result = cast(Dict[str, Any], response.json())
         logger.info(f"Repository created successfully: {result.get('path')}")
         return result
 
@@ -174,7 +179,7 @@ class HarnessDeepAgent:
         response = await self.client.post(url, json=payload)
         response.raise_for_status()
 
-        result = response.json()
+        result = cast(Dict[str, Any], response.json())
         logger.info(f"Pipeline created successfully: {pipeline_name}")
         return result
 
@@ -197,7 +202,7 @@ class HarnessDeepAgent:
         response = await self.client.get(url, params=params)
         response.raise_for_status()
 
-        return response.json()
+        return cast(Dict[str, Any], response.json())
 
     async def delegate_to_subagent(
         self, subagent: str, task: str, context: Dict[str, Any]
@@ -230,7 +235,7 @@ class HarnessDeepAgent:
 
     def plan_subagents_for_node(
         self, node_name: str, task: str, context: Dict[str, Any], capabilities: Sequence[str]
-    ):
+    ) -> List[SubagentInvocation]:
         """Plan subagent invocations when approaching a workflow node.
 
         This hook is typically called by the workflow engine (for example,
@@ -273,7 +278,7 @@ class HarnessDeepAgent:
         task: str,
         context: Dict[str, Any],
         capabilities: Sequence[str],
-    ):
+    ) -> List[SubagentInvocation]:
         """Plan subagent invocations when traversing a workflow edge.
 
         This hook is typically called by the workflow engine when execution is
