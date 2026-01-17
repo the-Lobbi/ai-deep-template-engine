@@ -92,7 +92,9 @@ class AgentRegistry:
 
     def instantiate(self, name: str, context: Dict[str, Any]) -> Any:
         """Instantiate a subagent by name."""
-        spec = self._registry[name]
+        spec = self._registry.get(name)
+        if spec is None:
+            raise KeyError(f"Subagent '{name}' is not registered")
         return spec.factory(context)
 
     def preserve_context(self, base_context: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
