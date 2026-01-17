@@ -274,7 +274,31 @@ class HarnessDeepAgent:
         context: Dict[str, Any],
         capabilities: Sequence[str],
     ):
-        """Plan subagent invocations when approaching a workflow edge."""
+        """Plan subagent invocations when traversing a workflow edge.
+
+        This hook is typically called by the workflow engine when execution is
+        about to move from one node to another. It inspects the task description
+        and required capabilities to determine which subagents should be invoked
+        along that edge.
+
+        Args:
+            source: Name or identifier of the source workflow node.
+            destination: Name or identifier of the destination workflow node.
+            task: Natural language or structured description of the work to be
+                performed while transitioning between ``source`` and
+                ``destination``.
+            context: Additional context and parameters for the task, such as
+                environment details, repository metadata, or user inputs. This
+                dictionary is forwarded to the selected subagents.
+            capabilities: List of capability identifiers required to complete
+                the task on this edge (for example, infrastructure provisioning
+                or code analysis capabilities).
+
+        Returns:
+            A list of subagent invocation plans (for example,
+            ``SubagentInvocation`` objects) describing which subagents should be
+            run for this edge and with what configuration.
+        """
         requirements = TaskRequirements(task=task, capabilities=capabilities, allow_team=True)
         return self.registry.plan_for_edge(source, destination, requirements, context)
 
