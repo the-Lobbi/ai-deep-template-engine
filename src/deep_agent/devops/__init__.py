@@ -43,6 +43,14 @@ Main Components:
         - PineconeKnowledgeStore: Persistent vector storage
         - create_rag_retriever: Factory for RAG retrieval systems
 
+    Secrets Management:
+        - SecretsManager: Unified interface for secrets across providers
+        - AzureKeyVaultProvider: Azure Key Vault integration
+        - HarnessSecretsProvider: Harness Secrets Manager integration
+        - EnvironmentProvider: Environment variable fallback
+        - configure_agent_secrets: Load all required secrets
+        - Automatic provider detection and caching
+
     Server:
         - FastAPI application for HTTP/REST API access
         - Asynchronous workflow execution
@@ -79,6 +87,33 @@ from .tools import (
     DevOpsToolRegistry,
     get_all_devops_tools,
     get_tools_for_agent,
+)
+
+# Observability clients
+from .observability import (
+    PrometheusClient,
+    LokiClient,
+    ElasticsearchClient,
+    AlertManagerClient,
+    get_prometheus_client,
+    get_loki_client,
+    get_elasticsearch_client,
+    get_alertmanager_client,
+    get_log_backend,
+)
+
+# Secrets management
+from .secrets import (
+    SecretsManager,
+    AzureKeyVaultProvider,
+    HarnessSecretsProvider,
+    EnvironmentProvider,
+    create_secrets_manager,
+    configure_agent_secrets,
+    SecretProvider,
+    SecretNotFoundError,
+    ProviderError,
+    ProviderNotAvailableError,
 )
 
 # Optional RAG imports (requires pinecone, voyageai dependencies)
@@ -135,6 +170,27 @@ __all__ = [
     "DevOpsToolRegistry",
     "get_all_devops_tools",
     "get_tools_for_agent",
+    # Observability clients
+    "PrometheusClient",
+    "LokiClient",
+    "ElasticsearchClient",
+    "AlertManagerClient",
+    "get_prometheus_client",
+    "get_loki_client",
+    "get_elasticsearch_client",
+    "get_alertmanager_client",
+    "get_log_backend",
+    # Secrets Management
+    "SecretsManager",
+    "AzureKeyVaultProvider",
+    "HarnessSecretsProvider",
+    "EnvironmentProvider",
+    "SecretProvider",
+    "create_secrets_manager",
+    "configure_agent_secrets",
+    "SecretNotFoundError",
+    "ProviderError",
+    "ProviderNotAvailableError",
     # RAG components
     "DevOpsKnowledgeBase",
     "VoyageEmbeddings",

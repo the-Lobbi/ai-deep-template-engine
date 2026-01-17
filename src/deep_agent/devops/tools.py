@@ -12,13 +12,783 @@ Integrates the claude-code-templating-plugin capabilities:
 
 import json
 import logging
-from datetime import datetime, timedelta
+import os
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
 
+import httpx
 from langchain_core.tools import StructuredTool
 from pydantic import BaseModel, Field
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_exponential,
+)
+
+from .secrets import SecretsManager
+from .observability import (
+    get_prometheus_client,
+    get_loki_client,
+    get_elasticsearch_client,
+    get_alertmanager_client,
+    get_log_backend,
+    PrometheusClient,
+)
+
+# Kubernetes client imports
+try:
+    from kubernetes import client as k8s_client, config as k8s_config
+    from kubernetes.client.rest import ApiException
+    KUBERNETES_AVAILABLE = True
+except ImportError:
+    KUBERNETES_AVAILABLE = False
+    k8s_client = None
+    k8s_config = None
+    ApiException = Exception
 
 logger = logging.getLogger(__name__)
+
+
+# =============================================================================
+# Kubernetes Client Wrapper
+# =============================================================================
+
+
+class KubernetesClient:
+    """Lazy-initialized Kubernetes client wrapper.
+
+    Supports both in-cluster config (when running in a pod) and kubeconfig file
+    (for local development). The client APIs are initialized lazily on first use.
+    """
+
+    def __init__(self):
+        """Initialize the Kubernetes client wrapper."""
+        self._core_api: Optional[k8s_client.CoreV1Api] = None
+        self._apps_api: Optional[k8s_client.AppsV1Api] = None
+        self._configured = False
+
+    def _configure(self) -> None:
+        """Configure the Kubernetes client.
+
+        Attempts to load in-cluster config first (for pods), then falls back
+        to kubeconfig file (for local development).
+
+        Raises:
+            RuntimeError: If kubernetes package is not installed
+            k8s_config.ConfigException: If no valid config is found
+        """
+        if not KUBERNETES_AVAILABLE:
+            raise RuntimeError(
+                "kubernetes package is not installed. "
+                "Install it with: pip install kubernetes>=29.0.0"
+            )
+
+        if not self._configured:
+            try:
+                # Try in-cluster config first (for pods running in Kubernetes)
+                k8s_config.load_incluster_config()
+                logger.info("Loaded in-cluster Kubernetes configuration")
+            except k8s_config.ConfigException:
+                # Fall back to kubeconfig file
+                try:
+                    k8s_config.load_kube_config()
+                    logger.info("Loaded kubeconfig file configuration")
+                except k8s_config.ConfigException as e:
+                    logger.error(f"Failed to load Kubernetes configuration: {e}")
+                    raise
+            self._configured = True
+
+    @property
+    def core_api(self) -> k8s_client.CoreV1Api:
+        """Get the CoreV1Api client for pods, services, etc.
+
+        Returns:
+            CoreV1Api instance
+        """
+        self._configure()
+        if self._core_api is None:
+            self._core_api = k8s_client.CoreV1Api()
+        return self._core_api
+
+    @property
+    def apps_api(self) -> k8s_client.AppsV1Api:
+        """Get the AppsV1Api client for deployments, statefulsets, etc.
+
+        Returns:
+            AppsV1Api instance
+        """
+        self._configure()
+        if self._apps_api is None:
+            self._apps_api = k8s_client.AppsV1Api()
+        return self._apps_api
+
+
+# Global Kubernetes client instance (lazy initialization)
+_k8s_client: Optional[KubernetesClient] = None
+
+
+def get_k8s_client() -> KubernetesClient:
+    """Get or create the global Kubernetes client instance.
+
+    Returns:
+        KubernetesClient instance
+    """
+    global _k8s_client
+    if _k8s_client is None:
+        _k8s_client = KubernetesClient()
+    return _k8s_client
+
+
+def _format_age(creation_timestamp: datetime) -> str:
+    """Format a creation timestamp as a human-readable age string.
+
+    Args:
+        creation_timestamp: The creation time
+
+    Returns:
+        Human-readable age string (e.g., "5d", "2h", "30m")
+    """
+    if creation_timestamp is None:
+        return "unknown"
+
+    now = datetime.now(timezone.utc)
+    if creation_timestamp.tzinfo is None:
+        creation_timestamp = creation_timestamp.replace(tzinfo=timezone.utc)
+
+    delta = now - creation_timestamp
+
+    if delta.days > 0:
+        return f"{delta.days}d"
+    elif delta.seconds >= 3600:
+        return f"{delta.seconds // 3600}h"
+    elif delta.seconds >= 60:
+        return f"{delta.seconds // 60}m"
+    else:
+        return f"{delta.seconds}s"
+
+
+def _pod_to_dict(pod: Any) -> Dict[str, Any]:
+    """Convert a Kubernetes Pod object to a dictionary.
+
+    Args:
+        pod: V1Pod object
+
+    Returns:
+        Dictionary representation of the pod
+    """
+    # Calculate ready containers
+    ready_count = 0
+    total_count = 0
+    restart_count = 0
+
+    if pod.status.container_statuses:
+        for cs in pod.status.container_statuses:
+            total_count += 1
+            if cs.ready:
+                ready_count += 1
+            restart_count += cs.restart_count or 0
+
+    return {
+        "name": pod.metadata.name,
+        "namespace": pod.metadata.namespace,
+        "status": pod.status.phase,
+        "ready": f"{ready_count}/{total_count}",
+        "restarts": restart_count,
+        "age": _format_age(pod.metadata.creation_timestamp),
+        "node": pod.spec.node_name,
+        "ip": pod.status.pod_ip,
+        "labels": dict(pod.metadata.labels) if pod.metadata.labels else {},
+    }
+
+
+def _service_to_dict(service: Any) -> Dict[str, Any]:
+    """Convert a Kubernetes Service object to a dictionary.
+
+    Args:
+        service: V1Service object
+
+    Returns:
+        Dictionary representation of the service
+    """
+    # Format ports
+    ports = []
+    if service.spec.ports:
+        for p in service.spec.ports:
+            port_str = f"{p.port}"
+            if p.target_port:
+                port_str += f":{p.target_port}"
+            port_str += f"/{p.protocol}"
+            ports.append(port_str)
+
+    external_ip = None
+    if service.status.load_balancer and service.status.load_balancer.ingress:
+        ingress = service.status.load_balancer.ingress[0]
+        external_ip = ingress.ip or ingress.hostname
+
+    return {
+        "name": service.metadata.name,
+        "namespace": service.metadata.namespace,
+        "type": service.spec.type,
+        "cluster_ip": service.spec.cluster_ip,
+        "external_ip": external_ip,
+        "ports": ", ".join(ports),
+        "age": _format_age(service.metadata.creation_timestamp),
+        "selector": dict(service.spec.selector) if service.spec.selector else {},
+    }
+
+
+def _deployment_to_dict(deployment: Any) -> Dict[str, Any]:
+    """Convert a Kubernetes Deployment object to a dictionary.
+
+    Args:
+        deployment: V1Deployment object
+
+    Returns:
+        Dictionary representation of the deployment
+    """
+    ready = deployment.status.ready_replicas or 0
+    desired = deployment.spec.replicas or 0
+    up_to_date = deployment.status.updated_replicas or 0
+    available = deployment.status.available_replicas or 0
+
+    return {
+        "name": deployment.metadata.name,
+        "namespace": deployment.metadata.namespace,
+        "ready": f"{ready}/{desired}",
+        "up_to_date": up_to_date,
+        "available": available,
+        "age": _format_age(deployment.metadata.creation_timestamp),
+        "replicas": desired,
+        "strategy": deployment.spec.strategy.type if deployment.spec.strategy else None,
+        "labels": dict(deployment.metadata.labels) if deployment.metadata.labels else {},
+    }
+
+
+# =============================================================================
+# Harness API Client
+# =============================================================================
+
+
+class HarnessClientError(Exception):
+    """Exception raised for Harness API errors."""
+
+    def __init__(self, message: str, status_code: Optional[int] = None, response_body: Optional[str] = None):
+        self.status_code = status_code
+        self.response_body = response_body
+        super().__init__(message)
+
+
+class HarnessClient:
+    """Async HTTP client for Harness API operations.
+
+    Supports pipeline management, template operations, and execution control.
+    Uses lazy initialization for credentials via SecretsManager.
+
+    Environment variables:
+        HARNESS_ACCOUNT_ID: Harness account identifier
+        HARNESS_API_URL: Harness API base URL (default: https://app.harness.io/gateway)
+        HARNESS_API_TOKEN: API token for authentication
+        HARNESS_ORG_IDENTIFIER: Organization identifier (default: default)
+        HARNESS_PROJECT_IDENTIFIER: Project identifier
+    """
+
+    _instance: Optional["HarnessClient"] = None
+    _initialized: bool = False
+
+    def __init__(self):
+        """Initialize the Harness client with lazy loading."""
+        self._client: Optional[httpx.AsyncClient] = None
+        self._account_id: Optional[str] = None
+        self._api_url: Optional[str] = None
+        self._api_token: Optional[str] = None
+        self._org_identifier: Optional[str] = None
+        self._project_identifier: Optional[str] = None
+        self._secrets_manager: Optional[SecretsManager] = None
+
+    @classmethod
+    def get_instance(cls) -> "HarnessClient":
+        """Get or create the singleton instance."""
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    async def _ensure_initialized(self) -> None:
+        """Ensure the client is initialized with credentials."""
+        if self._initialized:
+            return
+
+        # Load from environment first, then try secrets manager
+        self._account_id = os.getenv("HARNESS_ACCOUNT_ID")
+        self._api_url = os.getenv("HARNESS_API_URL", "https://app.harness.io/gateway")
+        self._api_token = os.getenv("HARNESS_API_TOKEN")
+        self._org_identifier = os.getenv("HARNESS_ORG_IDENTIFIER", "default")
+        self._project_identifier = os.getenv("HARNESS_PROJECT_IDENTIFIER")
+
+        # Try to get API token from secrets manager if not in environment
+        if not self._api_token:
+            try:
+                self._secrets_manager = SecretsManager(provider="auto")
+                self._api_token = await self._secrets_manager.get_harness_token()
+            except Exception as e:
+                logger.warning(f"Could not get Harness token from secrets manager: {e}")
+
+        if not self._account_id:
+            raise HarnessClientError("HARNESS_ACCOUNT_ID is required")
+
+        if not self._api_token:
+            raise HarnessClientError("HARNESS_API_TOKEN is required")
+
+        if not self._project_identifier:
+            raise HarnessClientError("HARNESS_PROJECT_IDENTIFIER is required")
+
+        # Create the HTTP client
+        self._client = httpx.AsyncClient(
+            base_url=self._api_url.rstrip("/"),
+            timeout=httpx.Timeout(30.0, connect=10.0),
+        )
+
+        self._initialized = True
+        logger.info(
+            f"Harness client initialized: account={self._account_id}, "
+            f"org={self._org_identifier}, project={self._project_identifier}"
+        )
+
+    def _get_headers(self) -> Dict[str, str]:
+        """Get headers for Harness API requests."""
+        return {
+            "x-api-key": self._api_token,
+            "Content-Type": "application/json",
+            "Harness-Account": self._account_id,
+        }
+
+    def _get_query_params(self) -> Dict[str, str]:
+        """Get common query parameters for Harness API requests."""
+        return {
+            "accountIdentifier": self._account_id,
+            "orgIdentifier": self._org_identifier,
+            "projectIdentifier": self._project_identifier,
+        }
+
+    @retry(
+        retry=retry_if_exception_type((httpx.NetworkError, httpx.TimeoutException)),
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+    )
+    async def _request(
+        self,
+        method: str,
+        path: str,
+        params: Optional[Dict[str, Any]] = None,
+        json_body: Optional[Dict[str, Any]] = None,
+        yaml_body: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Make an HTTP request to the Harness API.
+
+        Args:
+            method: HTTP method (GET, POST, PUT, DELETE)
+            path: API endpoint path
+            params: Query parameters
+            json_body: JSON request body
+            yaml_body: YAML request body (for pipeline creation)
+
+        Returns:
+            Parsed JSON response
+
+        Raises:
+            HarnessClientError: If the request fails
+        """
+        await self._ensure_initialized()
+
+        # Merge default params with provided params
+        all_params = {**self._get_query_params(), **(params or {})}
+
+        headers = self._get_headers()
+
+        # Handle YAML body for pipeline creation
+        content = None
+        if yaml_body:
+            headers["Content-Type"] = "application/yaml"
+            content = yaml_body
+
+        try:
+            response = await self._client.request(
+                method=method,
+                url=path,
+                params=all_params,
+                headers=headers,
+                json=json_body if not yaml_body else None,
+                content=content,
+            )
+
+            # Check for errors
+            if response.status_code >= 400:
+                error_body = response.text
+                try:
+                    error_json = response.json()
+                    error_msg = error_json.get("message", error_json.get("error", error_body))
+                except Exception:
+                    error_msg = error_body
+
+                raise HarnessClientError(
+                    f"Harness API error: {error_msg}",
+                    status_code=response.status_code,
+                    response_body=error_body,
+                )
+
+            return response.json()
+
+        except httpx.HTTPStatusError as e:
+            raise HarnessClientError(
+                f"HTTP error: {e}",
+                status_code=e.response.status_code,
+                response_body=e.response.text,
+            )
+        except httpx.RequestError as e:
+            raise HarnessClientError(f"Request error: {e}")
+
+    async def create_pipeline(
+        self,
+        name: str,
+        identifier: str,
+        yaml_content: str,
+    ) -> Dict[str, Any]:
+        """Create a new pipeline.
+
+        Args:
+            name: Pipeline name
+            identifier: Pipeline identifier
+            yaml_content: Complete pipeline YAML
+
+        Returns:
+            Created pipeline data
+        """
+        logger.info(f"Creating pipeline: {name} ({identifier})")
+
+        response = await self._request(
+            method="POST",
+            path="/pipeline/api/pipelines/v2",
+            yaml_body=yaml_content,
+        )
+
+        logger.info(f"Pipeline created successfully: {identifier}")
+        return response
+
+    async def validate_pipeline_yaml(self, yaml_content: str) -> Dict[str, Any]:
+        """Validate pipeline YAML.
+
+        Args:
+            yaml_content: Pipeline YAML to validate
+
+        Returns:
+            Validation result with errors and warnings
+        """
+        logger.info("Validating pipeline YAML")
+
+        response = await self._request(
+            method="POST",
+            path="/pipeline/api/pipelines/v2/validate-yaml",
+            yaml_body=yaml_content,
+        )
+
+        return response
+
+    async def create_template(
+        self,
+        name: str,
+        identifier: str,
+        template_type: str,
+        version_label: str,
+        yaml_content: str,
+        scope: str = "project",
+    ) -> Dict[str, Any]:
+        """Create a Harness template.
+
+        Args:
+            name: Template name
+            identifier: Template identifier
+            template_type: Template type (Step, Stage, Pipeline, StepGroup)
+            version_label: Version label
+            yaml_content: Template YAML content
+            scope: Template scope (account, org, project)
+
+        Returns:
+            Created template data
+        """
+        logger.info(f"Creating template: {name} ({identifier}), type={template_type}")
+
+        # Adjust path and params based on scope
+        params = {}
+        if scope == "account":
+            params = {"accountIdentifier": self._account_id}
+        elif scope == "org":
+            params = {
+                "accountIdentifier": self._account_id,
+                "orgIdentifier": self._org_identifier,
+            }
+        # project scope uses default params
+
+        response = await self._request(
+            method="POST",
+            path="/template/api/templates",
+            params=params,
+            yaml_body=yaml_content,
+        )
+
+        logger.info(f"Template created successfully: {identifier}")
+        return response
+
+    async def trigger_pipeline(
+        self,
+        pipeline_identifier: str,
+        inputs: Optional[Dict[str, Any]] = None,
+        notes: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """Trigger a pipeline execution.
+
+        Args:
+            pipeline_identifier: Pipeline identifier
+            inputs: Runtime inputs
+            notes: Execution notes
+
+        Returns:
+            Execution data including execution ID
+        """
+        logger.info(f"Triggering pipeline: {pipeline_identifier}")
+
+        body = {}
+        if inputs:
+            body["inputs"] = inputs
+        if notes:
+            body["notes"] = notes
+
+        response = await self._request(
+            method="POST",
+            path=f"/pipeline/api/pipelines/execute/{pipeline_identifier}",
+            json_body=body if body else None,
+        )
+
+        execution_id = response.get("data", {}).get("planExecution", {}).get("uuid")
+        logger.info(f"Pipeline triggered: execution_id={execution_id}")
+        return response
+
+    async def get_pipeline_execution(self, execution_id: str) -> Dict[str, Any]:
+        """Get pipeline execution status.
+
+        Args:
+            execution_id: Execution ID (planExecutionId)
+
+        Returns:
+            Execution status and details
+        """
+        logger.info(f"Getting pipeline execution: {execution_id}")
+
+        response = await self._request(
+            method="GET",
+            path=f"/pipeline/api/pipelines/execution/{execution_id}",
+        )
+
+        return response
+
+    async def close(self) -> None:
+        """Close the HTTP client."""
+        if self._client:
+            await self._client.aclose()
+            self._client = None
+            self._initialized = False
+            logger.info("Harness client closed")
+
+
+# Module-level lazy-loaded client
+_harness_client: Optional[HarnessClient] = None
+
+
+def get_harness_client() -> HarnessClient:
+    """Get the singleton Harness client instance."""
+    global _harness_client
+    if _harness_client is None:
+        _harness_client = HarnessClient.get_instance()
+    return _harness_client
+
+
+# =============================================================================
+# Tavily Search Client
+# =============================================================================
+
+
+class TavilySearchClient:
+    """Client for Tavily Web Search API.
+
+    Tavily provides AI-optimized web search with advanced filtering and
+    summarization capabilities.
+
+    Environment Variables:
+        TAVILY_API_KEY: API key for Tavily (required)
+    """
+
+    API_URL = "https://api.tavily.com/search"
+
+    def __init__(self, api_key: Optional[str] = None):
+        """Initialize Tavily search client."""
+        self.api_key = api_key or os.getenv("TAVILY_API_KEY")
+        if not self.api_key:
+            logger.warning("TAVILY_API_KEY not set.")
+
+    async def search(
+        self,
+        query: str,
+        max_results: int = 5,
+        search_depth: str = "advanced",
+        include_answer: bool = True,
+        exclude_domains: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Search the web using Tavily API."""
+        if not self.api_key:
+            raise ValueError("Tavily API key not configured.")
+
+        payload = {
+            "api_key": self.api_key,
+            "query": query,
+            "max_results": min(max(1, max_results), 20),
+            "search_depth": search_depth,
+            "include_answer": include_answer,
+        }
+        if exclude_domains:
+            payload["exclude_domains"] = exclude_domains
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(self.API_URL, json=payload, timeout=30.0)
+            response.raise_for_status()
+            return response.json()
+
+    async def search_devops(
+        self, query: str, max_results: int = 5
+    ) -> List[Dict[str, str]]:
+        """Search for DevOps-specific content."""
+        excluded = ["twitter.com", "facebook.com", "linkedin.com", "reddit.com"]
+        result = await self.search(query, max_results, exclude_domains=excluded)
+        formatted = []
+        if result.get("answer"):
+            formatted.append({
+                "title": "AI Summary",
+                "url": "",
+                "snippet": result["answer"],
+                "source": "tavily_answer",
+            })
+        for item in result.get("results", []):
+            formatted.append({
+                "title": item.get("title", ""),
+                "url": item.get("url", ""),
+                "snippet": item.get("content", "")[:500],
+                "source": "tavily",
+            })
+        return formatted[:max_results]
+
+
+_tavily_client: Optional[TavilySearchClient] = None
+
+
+def get_tavily_client() -> TavilySearchClient:
+    """Get or create the global Tavily client instance."""
+    global _tavily_client
+    if _tavily_client is None:
+        _tavily_client = TavilySearchClient()
+    return _tavily_client
+
+
+# =============================================================================
+# RAG Knowledge Base Integration
+# =============================================================================
+
+_rag_knowledge_base = None
+_rag_retriever = None
+_rag_embeddings = None
+_rag_initialized = False
+
+
+async def _ensure_rag_initialized():
+    """Initialize RAG components if not already done."""
+    global _rag_knowledge_base, _rag_retriever, _rag_embeddings, _rag_initialized
+
+    if _rag_initialized:
+        return _rag_knowledge_base is not None
+
+    _rag_initialized = True
+
+    try:
+        required_vars = ["PINECONE_API_KEY", "VOYAGE_API_KEY"]
+        missing_vars = [v for v in required_vars if not os.getenv(v)]
+        if missing_vars:
+            logger.warning(
+                f"RAG initialization skipped - missing env vars: {missing_vars}"
+            )
+            return False
+
+        from .rag import create_rag_retriever
+
+        logger.info("Initializing RAG retrieval system...")
+        _rag_knowledge_base, _rag_retriever, _rag_embeddings = (
+            await create_rag_retriever(namespace="devops", alpha=0.7)
+        )
+        logger.info("RAG retrieval system initialized successfully")
+        return True
+    except ImportError as e:
+        logger.warning(f"RAG module import failed: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"RAG initialization failed: {e}")
+        return False
+
+
+async def search_documentation_with_rag(
+    query: str, top_k: int = 5, source_filter: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    """Search documentation using the RAG system."""
+    if not await _ensure_rag_initialized():
+        return [{
+            "title": f"Documentation: {query}",
+            "content": f"[RAG not configured] Placeholder for: {query}",
+            "url": "",
+            "score": 0.0,
+            "source": "placeholder",
+        }]
+
+    try:
+        if source_filter:
+            filter_map = {
+                "kubernetes": _rag_knowledge_base.search_k8s_docs,
+                "harness": _rag_knowledge_base.search_harness_docs,
+                "terraform": _rag_knowledge_base.search_terraform_docs,
+                "runbooks": _rag_knowledge_base.search_runbooks,
+            }
+            search_func = filter_map.get(
+                source_filter, _rag_knowledge_base.search_all
+            )
+            results = await search_func(query, top_k=top_k)
+        else:
+            results = await _rag_retriever.retrieve(query, top_k=top_k)
+
+        formatted = []
+        for result in results:
+            formatted.append({
+                "title": result.metadata.get("title", result.id),
+                "content": result.content,
+                "url": result.metadata.get("url", ""),
+                "score": result.score,
+                "source": result.metadata.get("source", "unknown"),
+                "metadata": result.metadata,
+            })
+        logger.info(f"RAG search completed: {len(formatted)} results")
+        return formatted
+    except Exception as e:
+        logger.error(f"RAG search failed: {e}")
+        return [{
+            "title": "Search Error",
+            "content": f"Documentation search failed: {str(e)}",
+            "url": "",
+            "score": 0.0,
+            "source": "error",
+        }]
 
 
 # =============================================================================
@@ -735,6 +1505,183 @@ async def scaffold_project_impl(
 # =============================================================================
 
 
+def _generate_pipeline_yaml(
+    name: str,
+    identifier: str,
+    pipeline_type: str,
+    service: str,
+    environments: List[str],
+    stages: List[str],
+) -> str:
+    """Generate Harness pipeline YAML based on type.
+
+    Args:
+        name: Pipeline name
+        identifier: Pipeline identifier
+        pipeline_type: Pipeline type
+        service: Service name
+        environments: Target environments
+        stages: Stage names
+
+    Returns:
+        Complete pipeline YAML string
+    """
+    # Generate stage YAML based on pipeline type
+    stage_yaml_list = []
+
+    for i, stage_name in enumerate(stages):
+        stage_id = stage_name.lower().replace(" ", "_").replace("-", "_")
+
+        if "build" in stage_name.lower():
+            stage_yaml = f"""
+        - stage:
+            name: {stage_name}
+            identifier: {stage_id}
+            type: CI
+            spec:
+              cloneCodebase: true
+              execution:
+                steps:
+                  - step:
+                      type: Run
+                      name: Build
+                      identifier: build
+                      spec:
+                        shell: Bash
+                        command: |
+                          echo "Building {service}..."
+                          # Add your build commands here
+              platform:
+                os: Linux
+                arch: Amd64
+              runtime:
+                type: Cloud
+                spec: {{}}"""
+        elif "test" in stage_name.lower():
+            stage_yaml = f"""
+        - stage:
+            name: {stage_name}
+            identifier: {stage_id}
+            type: CI
+            spec:
+              cloneCodebase: true
+              execution:
+                steps:
+                  - step:
+                      type: Run
+                      name: Run Tests
+                      identifier: run_tests
+                      spec:
+                        shell: Bash
+                        command: |
+                          echo "Running tests for {service}..."
+                          # Add your test commands here
+              platform:
+                os: Linux
+                arch: Amd64
+              runtime:
+                type: Cloud
+                spec: {{}}"""
+        elif "approval" in stage_name.lower():
+            stage_yaml = f"""
+        - stage:
+            name: {stage_name}
+            identifier: {stage_id}
+            type: Approval
+            spec:
+              execution:
+                steps:
+                  - step:
+                      type: HarnessApproval
+                      name: Approval
+                      identifier: approval
+                      spec:
+                        approvalMessage: Please review and approve the deployment
+                        includePipelineExecutionHistory: true
+                        approvers:
+                          userGroups:
+                            - _project_all_users
+                          minimumCount: 1
+                          disallowPipelineExecutor: false"""
+        elif "deploy" in stage_name.lower():
+            # Determine target environment
+            env_name = "dev"
+            for env in environments:
+                if env.lower() in stage_name.lower():
+                    env_name = env
+                    break
+
+            stage_yaml = f"""
+        - stage:
+            name: {stage_name}
+            identifier: {stage_id}
+            type: Deployment
+            spec:
+              deploymentType: Kubernetes
+              service:
+                serviceRef: {service}
+              environment:
+                environmentRef: {env_name}
+                deployToAll: false
+                infrastructureDefinitions:
+                  - identifier: {env_name}_infra
+              execution:
+                steps:
+                  - step:
+                      type: K8sRollingDeploy
+                      name: Rolling Deployment
+                      identifier: rolling_deploy
+                      spec:
+                        skipDryRun: false
+                rollbackSteps:
+                  - step:
+                      type: K8sRollingRollback
+                      name: Rollback
+                      identifier: rollback
+                      spec: {{}}"""
+        else:
+            # Generic stage
+            stage_yaml = f"""
+        - stage:
+            name: {stage_name}
+            identifier: {stage_id}
+            type: Custom
+            spec:
+              execution:
+                steps:
+                  - step:
+                      type: ShellScript
+                      name: {stage_name}
+                      identifier: {stage_id}_step
+                      spec:
+                        shell: Bash
+                        onDelegate: true
+                        source:
+                          type: Inline
+                          spec:
+                            script: |
+                              echo "Executing {stage_name}..."
+                        environmentVariables: []
+                        outputVariables: []"""
+
+        stage_yaml_list.append(stage_yaml)
+
+    stages_yaml = "\n".join(stage_yaml_list)
+
+    pipeline_yaml = f"""pipeline:
+  name: {name}
+  identifier: {identifier}
+  projectIdentifier: <+pipeline.projectIdentifier>
+  orgIdentifier: <+pipeline.orgIdentifier>
+  tags:
+    pipeline_type: {pipeline_type}
+    service: {service}
+  stages:{stages_yaml}
+"""
+
+    return pipeline_yaml
+
+
 async def create_pipeline_impl(
     name: str,
     pipeline_type: str,
@@ -742,17 +1689,17 @@ async def create_pipeline_impl(
     environments: List[str],
     stages: Optional[List[str]],
 ) -> Dict[str, Any]:
-    """Create Harness pipeline.
+    """Create Harness pipeline using the Harness API.
 
     Args:
         name: Pipeline name
-        pipeline_type: Pipeline type
+        pipeline_type: Pipeline type (standard-cicd, gitops, canary, blue-green)
         service: Service name
         environments: Target environments
         stages: Custom stages
 
     Returns:
-        Pipeline creation result
+        Pipeline creation result including pipeline ID and URL
     """
     try:
         logger.info(
@@ -773,34 +1720,68 @@ async def create_pipeline_impl(
             else:
                 stages = ["Build", "Deploy"]
 
-        # Placeholder implementation
+        # Generate identifier from name
+        identifier = name.lower().replace(" ", "_").replace("-", "_")
+
+        # Generate pipeline YAML
+        pipeline_yaml = _generate_pipeline_yaml(
+            name=name,
+            identifier=identifier,
+            pipeline_type=pipeline_type,
+            service=service,
+            environments=environments,
+            stages=stages,
+        )
+
+        # Create pipeline via Harness API
+        client = get_harness_client()
+        response = await client.create_pipeline(
+            name=name,
+            identifier=identifier,
+            yaml_content=pipeline_yaml,
+        )
+
+        # Extract pipeline data from response
+        pipeline_data = response.get("data", {})
+        pipeline_identifier = pipeline_data.get("identifier", identifier)
+
+        # Build Harness URL
+        account_id = client._account_id
+        org_id = client._org_identifier
+        project_id = client._project_identifier
+        harness_url = (
+            f"https://app.harness.io/ng/account/{account_id}/cd/orgs/{org_id}/"
+            f"projects/{project_id}/pipelines/{pipeline_identifier}/pipeline-studio"
+        )
+
         result = {
             "name": name,
             "type": pipeline_type,
             "service": service,
             "environments": environments,
             "stages": stages,
-            "pipeline_id": f"pipeline-{datetime.now().timestamp()}",
+            "pipeline_id": pipeline_identifier,
             "status": "created",
-            "yaml_path": f".harness/pipelines/{name}.yaml",
-            "url": f"https://app.harness.io/pipeline/{name}",
+            "yaml_path": f".harness/pipelines/{identifier}.yaml",
+            "url": harness_url,
+            "yaml_content": pipeline_yaml,
+            "api_response": pipeline_data,
             "timestamp": datetime.now().isoformat(),
         }
-
-        # TODO: Integrate with Harness MCP and harness-expert agent
-        # from claude_code_templating_plugin.agents import HarnessExpertAgent
-        # agent = HarnessExpertAgent()
-        # result = agent.create_pipeline(
-        #     name=name,
-        #     pipeline_type=pipeline_type,
-        #     service=service,
-        #     environments=environments,
-        #     stages=stages
-        # )
 
         logger.info(f"Pipeline created: {result['pipeline_id']}")
         return result
 
+    except HarnessClientError as e:
+        logger.error(f"Harness API error creating pipeline: {e}")
+        return {
+            "name": name,
+            "status": "failed",
+            "error": str(e),
+            "status_code": e.status_code,
+            "response_body": e.response_body,
+            "timestamp": datetime.now().isoformat(),
+        }
     except Exception as e:
         logger.error(f"Pipeline creation failed: {e}")
         return {
@@ -812,95 +1793,305 @@ async def create_pipeline_impl(
 
 
 async def validate_pipeline_impl(yaml_content: str) -> Dict[str, Any]:
-    """Validate Harness pipeline YAML.
+    """Validate Harness pipeline YAML using the Harness API.
 
     Args:
         yaml_content: Pipeline YAML content
 
     Returns:
-        Validation result
+        Validation result with errors, warnings, and suggestions
     """
     try:
-        logger.info("Validating pipeline YAML")
+        logger.info("Validating pipeline YAML via Harness API")
 
-        # Placeholder implementation
+        # Call Harness API for validation
+        client = get_harness_client()
+        response = await client.validate_pipeline_yaml(yaml_content)
+
+        # Parse validation response
+        validation_data = response.get("data", {})
+        validation_result = validation_data.get("validationResult", {})
+
+        # Extract errors and warnings
+        errors = []
+        warnings = []
+        suggestions = []
+
+        # Check for validation errors
+        if validation_result.get("valid") is False:
+            error_messages = validation_result.get("errorMessages", [])
+            for error in error_messages:
+                if isinstance(error, dict):
+                    errors.append(error.get("message", str(error)))
+                else:
+                    errors.append(str(error))
+
+        # Check for validation warnings
+        warning_messages = validation_result.get("warningMessages", [])
+        for warning in warning_messages:
+            if isinstance(warning, dict):
+                warnings.append(warning.get("message", str(warning)))
+            else:
+                warnings.append(str(warning))
+
+        # Add best practice suggestions based on YAML analysis
+        yaml_lower = yaml_content.lower()
+
+        if "timeout" not in yaml_lower:
+            suggestions.append("Consider adding timeout values to steps for better resource management")
+
+        if "failurestrategy" not in yaml_lower:
+            suggestions.append("Add failure strategies to handle step/stage failures gracefully")
+
+        if "rollbacksteps" not in yaml_lower and "deployment" in yaml_lower:
+            suggestions.append("Add rollback steps for deployment stages")
+
+        if "approval" not in yaml_lower and "prod" in yaml_lower:
+            suggestions.append("Add approval gates before production deployments")
+
+        if "notification" not in yaml_lower:
+            suggestions.append("Consider adding notification rules for pipeline events")
+
+        # Calculate quality score
+        quality_score = 100
+        quality_score -= len(errors) * 20
+        quality_score -= len(warnings) * 5
+        quality_score -= max(0, len(suggestions) - 2) * 2
+        quality_score = max(0, min(100, quality_score))
+
         result = {
-            "valid": True,
-            "errors": [],
-            "warnings": [
-                "Consider adding timeout values to all steps",
-                "Add failure strategy for critical stages",
-            ],
-            "suggestions": [
-                "Use pipeline templates for better reusability",
-                "Add approval gates before production deployment",
-            ],
-            "quality_score": 88,
+            "valid": len(errors) == 0,
+            "errors": errors,
+            "warnings": warnings,
+            "suggestions": suggestions,
+            "quality_score": quality_score,
+            "api_response": validation_data,
             "timestamp": datetime.now().isoformat(),
         }
 
-        # TODO: Integrate with Harness validation
-        # from claude_code_templating_plugin.harness import PipelineValidator
-        # validator = PipelineValidator()
-        # result = validator.validate(yaml_content)
-
-        logger.info(f"Validation complete: valid={result['valid']}")
+        logger.info(f"Validation complete: valid={result['valid']}, errors={len(errors)}, warnings={len(warnings)}")
         return result
 
+    except HarnessClientError as e:
+        logger.error(f"Harness API validation error: {e}")
+        return {
+            "valid": False,
+            "errors": [str(e)],
+            "warnings": [],
+            "suggestions": [],
+            "status_code": e.status_code,
+            "response_body": e.response_body,
+            "timestamp": datetime.now().isoformat(),
+        }
     except Exception as e:
         logger.error(f"Pipeline validation failed: {e}")
         return {
             "valid": False,
             "errors": [str(e)],
+            "warnings": [],
+            "suggestions": [],
             "timestamp": datetime.now().isoformat(),
         }
+
+
+def _generate_template_yaml(
+    name: str,
+    identifier: str,
+    template_type: str,
+    version_label: str,
+    config: Dict[str, Any],
+) -> str:
+    """Generate Harness template YAML.
+
+    Args:
+        name: Template name
+        identifier: Template identifier
+        template_type: Template type (Step, Stage, Pipeline, StepGroup)
+        version_label: Version label
+        config: Template configuration
+
+    Returns:
+        Template YAML string
+    """
+    # Normalize template type to Harness format
+    type_mapping = {
+        "step": "Step",
+        "stage": "Stage",
+        "pipeline": "Pipeline",
+        "stepgroup": "StepGroup",
+    }
+    harness_type = type_mapping.get(template_type.lower(), template_type)
+
+    # Default spec based on template type
+    if harness_type == "Step":
+        spec_yaml = config.get("spec", {
+            "type": "ShellScript",
+            "spec": {
+                "shell": "Bash",
+                "onDelegate": True,
+                "source": {
+                    "type": "Inline",
+                    "spec": {
+                        "script": config.get("script", "echo 'Hello from template'")
+                    }
+                }
+            }
+        })
+    elif harness_type == "Stage":
+        spec_yaml = config.get("spec", {
+            "type": "Custom",
+            "spec": {
+                "execution": {
+                    "steps": [
+                        {
+                            "step": {
+                                "type": "ShellScript",
+                                "name": "Template Step",
+                                "identifier": "template_step",
+                                "spec": {
+                                    "shell": "Bash",
+                                    "onDelegate": True,
+                                    "source": {
+                                        "type": "Inline",
+                                        "spec": {
+                                            "script": "echo 'Stage from template'"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    ]
+                }
+            }
+        })
+    else:
+        spec_yaml = config.get("spec", {})
+
+    # Build template inputs
+    template_inputs = config.get("templateInputs", [])
+    inputs_yaml = ""
+    if template_inputs:
+        inputs_list = []
+        for inp in template_inputs:
+            inp_name = inp.get("name", "input")
+            inp_type = inp.get("type", "String")
+            inp_default = inp.get("default", "")
+            inputs_list.append(f"    - name: {inp_name}\n      type: {inp_type}\n      default: {inp_default}")
+        inputs_yaml = "\n  templateInputs:\n" + "\n".join(inputs_list)
+
+    # Convert spec to YAML format
+    import json
+    spec_json = json.dumps(spec_yaml, indent=4)
+    # Indent spec properly
+    spec_lines = spec_json.split("\n")
+    indented_spec = "\n".join("    " + line for line in spec_lines)
+
+    template_yaml = f"""template:
+  name: {name}
+  identifier: {identifier}
+  versionLabel: {version_label}
+  type: {harness_type}
+  projectIdentifier: <+template.projectIdentifier>
+  orgIdentifier: <+template.orgIdentifier>
+  tags:
+    created_by: devops_agent
+  spec:
+{indented_spec}{inputs_yaml}
+"""
+
+    return template_yaml
 
 
 async def create_template_impl(
     template_type: str, name: str, scope: str, config: Dict[str, Any]
 ) -> Dict[str, Any]:
-    """Create Harness reusable template.
+    """Create Harness reusable template using the Harness API.
 
     Args:
-        template_type: Template type (step, stage, pipeline)
+        template_type: Template type (step, stage, pipeline, stepgroup)
         name: Template name
         scope: Template scope (account, org, project)
-        config: Template configuration
+        config: Template configuration including spec and optional templateInputs
 
     Returns:
-        Template creation result
+        Template creation result including template ID and URL
     """
     try:
         logger.info(
             f"Creating Harness template: type={template_type}, name={name}, scope={scope}"
         )
 
-        # Placeholder implementation
+        # Generate identifier from name
+        identifier = name.lower().replace(" ", "_").replace("-", "_")
+        version_label = config.get("version", "1.0.0")
+
+        # Generate template YAML
+        template_yaml = _generate_template_yaml(
+            name=name,
+            identifier=identifier,
+            template_type=template_type,
+            version_label=version_label,
+            config=config,
+        )
+
+        # Create template via Harness API
+        client = get_harness_client()
+        response = await client.create_template(
+            name=name,
+            identifier=identifier,
+            template_type=template_type,
+            version_label=version_label,
+            yaml_content=template_yaml,
+            scope=scope,
+        )
+
+        # Extract template data from response
+        template_data = response.get("data", {})
+        template_identifier = template_data.get("identifier", identifier)
+
+        # Build Harness URL
+        account_id = client._account_id
+        org_id = client._org_identifier
+        project_id = client._project_identifier
+
+        if scope == "account":
+            harness_url = f"https://app.harness.io/ng/account/{account_id}/settings/templates/{template_identifier}"
+        elif scope == "org":
+            harness_url = f"https://app.harness.io/ng/account/{account_id}/settings/organizations/{org_id}/templates/{template_identifier}"
+        else:
+            harness_url = (
+                f"https://app.harness.io/ng/account/{account_id}/cd/orgs/{org_id}/"
+                f"projects/{project_id}/setup/resources/templates/{template_identifier}"
+            )
+
         result = {
             "type": template_type,
             "name": name,
             "scope": scope,
-            "template_id": f"template-{datetime.now().timestamp()}",
+            "template_id": template_identifier,
+            "version": version_label,
             "status": "created",
-            "version": "1.0",
-            "yaml_path": f".harness/templates/{template_type}/{name}.yaml",
-            "url": f"https://app.harness.io/template/{name}",
+            "yaml_path": f".harness/templates/{template_type}/{identifier}.yaml",
+            "url": harness_url,
+            "yaml_content": template_yaml,
+            "api_response": template_data,
             "timestamp": datetime.now().isoformat(),
         }
-
-        # TODO: Integrate with Harness MCP
-        # from claude_code_templating_plugin.harness import TemplateManager
-        # manager = TemplateManager()
-        # result = manager.create_template(
-        #     template_type=template_type,
-        #     name=name,
-        #     scope=scope,
-        #     config=config
-        # )
 
         logger.info(f"Template created: {result['template_id']}")
         return result
 
+    except HarnessClientError as e:
+        logger.error(f"Harness API error creating template: {e}")
+        return {
+            "type": template_type,
+            "name": name,
+            "status": "failed",
+            "error": str(e),
+            "status_code": e.status_code,
+            "response_body": e.response_body,
+            "timestamp": datetime.now().isoformat(),
+        }
     except Exception as e:
         logger.error(f"Template creation failed: {e}")
         return {
@@ -915,107 +2106,219 @@ async def create_template_impl(
 async def trigger_pipeline_impl(
     pipeline_id: str, inputs: Dict[str, Any], environment: Optional[str]
 ) -> Dict[str, Any]:
-    """Trigger Harness pipeline execution.
+    """Trigger Harness pipeline execution using the Harness API.
 
     Args:
         pipeline_id: Pipeline identifier
         inputs: Runtime inputs
-        environment: Target environment
+        environment: Target environment (added to inputs if specified)
 
     Returns:
-        Execution information
+        Execution information including execution ID and status URL
     """
     try:
         logger.info(
             f"Triggering pipeline: id={pipeline_id}, env={environment}"
         )
 
-        # Placeholder implementation
+        # Add environment to inputs if specified
+        execution_inputs = dict(inputs) if inputs else {}
+        if environment:
+            execution_inputs["environment"] = environment
+
+        # Build execution notes
+        notes = f"Triggered via DevOps Agent at {datetime.now().isoformat()}"
+        if environment:
+            notes += f" for environment: {environment}"
+
+        # Trigger pipeline via Harness API
+        client = get_harness_client()
+        response = await client.trigger_pipeline(
+            pipeline_identifier=pipeline_id,
+            inputs=execution_inputs if execution_inputs else None,
+            notes=notes,
+        )
+
+        # Extract execution data from response
+        execution_data = response.get("data", {})
+        plan_execution = execution_data.get("planExecution", {})
+        execution_id = plan_execution.get("uuid", plan_execution.get("planExecutionId"))
+
+        # Get execution status
+        status = plan_execution.get("status", "RUNNING")
+
+        # Build Harness execution URL
+        account_id = client._account_id
+        org_id = client._org_identifier
+        project_id = client._project_identifier
+        harness_url = (
+            f"https://app.harness.io/ng/account/{account_id}/cd/orgs/{org_id}/"
+            f"projects/{project_id}/pipelines/{pipeline_id}/executions/{execution_id}/pipeline"
+        )
+
+        # Extract stage information if available
+        stages = []
+        layout_node_map = plan_execution.get("layoutNodeMap", {})
+        for node_id, node_info in layout_node_map.items():
+            if node_info.get("nodeType") == "STAGE":
+                stages.append({
+                    "name": node_info.get("name"),
+                    "identifier": node_info.get("nodeIdentifier"),
+                    "status": node_info.get("status", "QUEUED"),
+                })
+
         result = {
             "pipeline_id": pipeline_id,
-            "execution_id": f"exec-{datetime.now().timestamp()}",
-            "status": "running",
+            "execution_id": execution_id,
+            "status": status,
             "environment": environment,
-            "inputs": inputs,
-            "url": f"https://app.harness.io/execution/{pipeline_id}",
+            "inputs": execution_inputs,
+            "url": harness_url,
             "started_at": datetime.now().isoformat(),
-            "stages": [
-                {"name": "Build", "status": "running"},
-                {"name": "Deploy", "status": "pending"},
-            ],
+            "stages": stages if stages else [{"name": "Initializing", "status": "QUEUED"}],
+            "api_response": execution_data,
             "timestamp": datetime.now().isoformat(),
         }
 
-        # TODO: Integrate with Harness API via MCP
-        # from claude_code_templating_plugin.harness import PipelineExecutor
-        # executor = PipelineExecutor()
-        # result = executor.trigger(
-        #     pipeline_id=pipeline_id,
-        #     inputs=inputs,
-        #     environment=environment
-        # )
-
-        logger.info(f"Pipeline triggered: {result['execution_id']}")
+        logger.info(f"Pipeline triggered: execution_id={execution_id}, status={status}")
         return result
 
+    except HarnessClientError as e:
+        logger.error(f"Harness API error triggering pipeline: {e}")
+        return {
+            "pipeline_id": pipeline_id,
+            "status": "FAILED",
+            "error": str(e),
+            "status_code": e.status_code,
+            "response_body": e.response_body,
+            "timestamp": datetime.now().isoformat(),
+        }
     except Exception as e:
         logger.error(f"Pipeline trigger failed: {e}")
         return {
             "pipeline_id": pipeline_id,
-            "status": "failed",
+            "status": "FAILED",
             "error": str(e),
             "timestamp": datetime.now().isoformat(),
         }
 
 
 async def get_pipeline_status_impl(execution_id: str) -> Dict[str, Any]:
-    """Get pipeline execution status.
+    """Get pipeline execution status using the Harness API.
 
     Args:
-        execution_id: Execution ID
+        execution_id: Execution ID (planExecutionId)
 
     Returns:
-        Execution status and details
+        Execution status including stage-level details
     """
     try:
         logger.info(f"Getting pipeline status: execution_id={execution_id}")
 
-        # Placeholder implementation
+        # Get execution status via Harness API
+        client = get_harness_client()
+        response = await client.get_pipeline_execution(execution_id)
+
+        # Extract execution data
+        execution_data = response.get("data", {})
+        plan_execution = execution_data.get("pipelineExecutionSummary", {})
+
+        # Get overall status
+        status = plan_execution.get("status", "UNKNOWN")
+
+        # Calculate duration
+        start_ts = plan_execution.get("startTs")
+        end_ts = plan_execution.get("endTs")
+        duration_seconds = None
+        if start_ts and end_ts:
+            duration_seconds = (end_ts - start_ts) // 1000
+        elif start_ts:
+            # Still running, calculate from start
+            duration_seconds = int((datetime.now().timestamp() * 1000 - start_ts) // 1000)
+
+        # Extract stage information
+        stages = []
+        layout_node_map = plan_execution.get("layoutNodeMap", {})
+        starting_node_id = plan_execution.get("startingNodeId")
+
+        # Process stages in order
+        def process_node(node_id: str, visited: set):
+            if not node_id or node_id in visited:
+                return
+            visited.add(node_id)
+
+            node_info = layout_node_map.get(node_id, {})
+            if node_info.get("nodeType") == "STAGE":
+                stage_start = node_info.get("startTs")
+                stage_end = node_info.get("endTs")
+                stage_duration = None
+                if stage_start and stage_end:
+                    stage_duration = (stage_end - stage_start) // 1000
+
+                stages.append({
+                    "name": node_info.get("name"),
+                    "identifier": node_info.get("nodeIdentifier"),
+                    "status": node_info.get("status", "UNKNOWN"),
+                    "duration_seconds": stage_duration,
+                    "started_at": datetime.fromtimestamp(stage_start / 1000).isoformat() if stage_start else None,
+                    "ended_at": datetime.fromtimestamp(stage_end / 1000).isoformat() if stage_end else None,
+                })
+
+            # Process next nodes
+            for next_id in node_info.get("edgeLayoutList", {}).get("nextIds", []):
+                process_node(next_id, visited)
+
+        # Start processing from the starting node
+        if starting_node_id:
+            process_node(starting_node_id, set())
+
+        # Build Harness execution URL
+        account_id = client._account_id
+        org_id = client._org_identifier
+        project_id = client._project_identifier
+        pipeline_id = plan_execution.get("pipelineIdentifier", "unknown")
+        harness_url = (
+            f"https://app.harness.io/ng/account/{account_id}/cd/orgs/{org_id}/"
+            f"projects/{project_id}/pipelines/{pipeline_id}/executions/{execution_id}/pipeline"
+        )
+
+        # Get pipeline and run sequence info
+        pipeline_name = plan_execution.get("name", pipeline_id)
+        run_sequence = plan_execution.get("runSequence", 0)
+
         result = {
             "execution_id": execution_id,
-            "status": "success",
-            "duration_seconds": 245,
-            "stages": [
-                {
-                    "name": "Build",
-                    "status": "success",
-                    "duration_seconds": 120,
-                    "started_at": datetime.now().isoformat(),
-                },
-                {
-                    "name": "Deploy",
-                    "status": "success",
-                    "duration_seconds": 125,
-                    "started_at": (datetime.now() + timedelta(seconds=120)).isoformat(),
-                },
-            ],
-            "url": f"https://app.harness.io/execution/{execution_id}",
+            "pipeline_id": pipeline_id,
+            "pipeline_name": pipeline_name,
+            "run_sequence": run_sequence,
+            "status": status,
+            "duration_seconds": duration_seconds,
+            "started_at": datetime.fromtimestamp(start_ts / 1000).isoformat() if start_ts else None,
+            "ended_at": datetime.fromtimestamp(end_ts / 1000).isoformat() if end_ts else None,
+            "stages": stages,
+            "url": harness_url,
+            "api_response": execution_data,
             "timestamp": datetime.now().isoformat(),
         }
 
-        # TODO: Integrate with Harness API
-        # from claude_code_templating_plugin.harness import PipelineExecutor
-        # executor = PipelineExecutor()
-        # result = executor.get_status(execution_id)
-
-        logger.info(f"Execution status: {result['status']}")
+        logger.info(f"Execution status: {status}, stages: {len(stages)}")
         return result
 
+    except HarnessClientError as e:
+        logger.error(f"Harness API error getting execution status: {e}")
+        return {
+            "execution_id": execution_id,
+            "status": "ERROR",
+            "error": str(e),
+            "status_code": e.status_code,
+            "response_body": e.response_body,
+            "timestamp": datetime.now().isoformat(),
+        }
     except Exception as e:
         logger.error(f"Failed to get pipeline status: {e}")
         return {
             "execution_id": execution_id,
-            "status": "unknown",
+            "status": "UNKNOWN",
             "error": str(e),
             "timestamp": datetime.now().isoformat(),
         }
@@ -1271,7 +2574,10 @@ async def generate_migrations_impl(
 
 
 async def web_search_impl(query: str, max_results: int) -> List[Dict[str, str]]:
-    """Search the web for DevOps solutions and documentation.
+    """Search the web for DevOps solutions and documentation using Tavily API.
+
+    Uses the Tavily Web Search API for AI-optimized search results.
+    Falls back to placeholder results if TAVILY_API_KEY is not configured.
 
     Args:
         query: Search query string
@@ -1283,22 +2589,39 @@ async def web_search_impl(query: str, max_results: int) -> List[Dict[str, str]]:
     try:
         logger.info(f"Web search: {query} (max_results={max_results})")
 
-        # Placeholder implementation
-        results = [
-            {
-                "title": f"DevOps Best Practice: {query}",
-                "url": f"https://docs.example.com/devops/{query.replace(' ', '-').lower()}",
-                "snippet": f"Comprehensive guide on {query} including implementation patterns, "
-                f"troubleshooting, and production considerations.",
-                "source": "placeholder",
-            }
-        ]
+        # Get the Tavily client
+        tavily = get_tavily_client()
 
-        # TODO: Integrate with actual search API (Tavily, SerpAPI)
+        # Check if API key is configured
+        if not tavily.api_key:
+            logger.warning("Tavily API key not configured, returning placeholder results")
+            return [
+                {
+                    "title": f"DevOps Best Practice: {query}",
+                    "url": f"https://docs.example.com/devops/{query.replace(' ', '-').lower()}",
+                    "snippet": f"[Tavily not configured] Guide on {query} including patterns, "
+                    f"troubleshooting, and production considerations.",
+                    "source": "placeholder",
+                }
+            ]
 
-        logger.info(f"Found {len(results)} results")
+        # Use Tavily for DevOps-optimized search
+        results = await tavily.search_devops(query=query, max_results=max_results)
+
+        logger.info(f"Tavily search found {len(results)} results")
         return results
 
+    except ValueError as e:
+        # API key not configured
+        logger.warning(f"Tavily configuration error: {e}")
+        return [
+            {
+                "title": f"DevOps Best Practice: {query}",
+                "url": "",
+                "snippet": f"[Search unavailable] {str(e)}",
+                "source": "error",
+            }
+        ]
     except Exception as e:
         logger.error(f"Web search failed: {e}")
         return [{"error": str(e), "title": "Search failed", "url": "", "snippet": ""}]
@@ -1307,35 +2630,51 @@ async def web_search_impl(query: str, max_results: int) -> List[Dict[str, str]]:
 async def kubernetes_get_pods_impl(
     namespace: str, label_selector: Optional[str]
 ) -> List[Dict[str, Any]]:
-    """Get Kubernetes pods.
+    """Get Kubernetes pods using the Kubernetes API.
 
     Args:
         namespace: Kubernetes namespace
-        label_selector: Optional label selector
+        label_selector: Optional label selector (e.g., 'app=nginx,env=prod')
 
     Returns:
-        List of pods
+        List of pod dictionaries with status, readiness, and resource info
     """
     try:
         logger.info(f"Getting K8s pods: namespace={namespace}, labels={label_selector}")
 
-        # Placeholder implementation
-        pods = [
-            {
-                "name": "example-pod-001",
-                "namespace": namespace,
-                "status": "Running",
-                "ready": "1/1",
-                "restarts": 0,
-                "age": "5d",
-                "node": "node-1",
-            }
-        ]
+        if not KUBERNETES_AVAILABLE:
+            return [{
+                "error": "kubernetes package not installed",
+                "name": "client-unavailable",
+                "message": "Install with: pip install kubernetes>=29.0.0"
+            }]
 
-        # TODO: Integrate with kubernetes client
+        k8s = get_k8s_client()
+
+        # Call the Kubernetes API
+        pod_list = k8s.core_api.list_namespaced_pod(
+            namespace=namespace,
+            label_selector=label_selector or ""
+        )
+
+        # Convert pods to dictionaries
+        pods = [_pod_to_dict(pod) for pod in pod_list.items]
 
         logger.info(f"Found {len(pods)} pods")
         return pods
+
+    except ApiException as e:
+        logger.error(f"Kubernetes API error getting pods: {e.status} - {e.reason}")
+        error_msg = f"API error: {e.reason}"
+        if e.status == 404:
+            error_msg = f"Namespace '{namespace}' not found"
+        elif e.status == 403:
+            error_msg = f"Access denied to namespace '{namespace}'"
+        return [{"error": error_msg, "name": "api-error", "status_code": e.status}]
+
+    except RuntimeError as e:
+        logger.error(f"Kubernetes client error: {e}")
+        return [{"error": str(e), "name": "client-error"}]
 
     except Exception as e:
         logger.error(f"Failed to get pods: {e}")
@@ -1343,33 +2682,47 @@ async def kubernetes_get_pods_impl(
 
 
 async def kubernetes_get_services_impl(namespace: str) -> List[Dict[str, Any]]:
-    """Get Kubernetes services.
+    """Get Kubernetes services using the Kubernetes API.
 
     Args:
         namespace: Kubernetes namespace
 
     Returns:
-        List of services
+        List of service dictionaries with type, IPs, ports, and selectors
     """
     try:
         logger.info(f"Getting K8s services: namespace={namespace}")
 
-        # Placeholder implementation
-        services = [
-            {
-                "name": "example-service",
-                "namespace": namespace,
-                "type": "ClusterIP",
-                "cluster_ip": "10.0.0.1",
-                "ports": "80/TCP",
-                "age": "10d",
-            }
-        ]
+        if not KUBERNETES_AVAILABLE:
+            return [{
+                "error": "kubernetes package not installed",
+                "name": "client-unavailable",
+                "message": "Install with: pip install kubernetes>=29.0.0"
+            }]
 
-        # TODO: Integrate with kubernetes client
+        k8s = get_k8s_client()
+
+        # Call the Kubernetes API
+        service_list = k8s.core_api.list_namespaced_service(namespace=namespace)
+
+        # Convert services to dictionaries
+        services = [_service_to_dict(svc) for svc in service_list.items]
 
         logger.info(f"Found {len(services)} services")
         return services
+
+    except ApiException as e:
+        logger.error(f"Kubernetes API error getting services: {e.status} - {e.reason}")
+        error_msg = f"API error: {e.reason}"
+        if e.status == 404:
+            error_msg = f"Namespace '{namespace}' not found"
+        elif e.status == 403:
+            error_msg = f"Access denied to namespace '{namespace}'"
+        return [{"error": error_msg, "name": "api-error", "status_code": e.status}]
+
+    except RuntimeError as e:
+        logger.error(f"Kubernetes client error: {e}")
+        return [{"error": str(e), "name": "client-error"}]
 
     except Exception as e:
         logger.error(f"Failed to get services: {e}")
@@ -1377,33 +2730,47 @@ async def kubernetes_get_services_impl(namespace: str) -> List[Dict[str, Any]]:
 
 
 async def kubernetes_get_deployments_impl(namespace: str) -> List[Dict[str, Any]]:
-    """Get Kubernetes deployments.
+    """Get Kubernetes deployments using the Kubernetes API.
 
     Args:
         namespace: Kubernetes namespace
 
     Returns:
-        List of deployments
+        List of deployment dictionaries with replica counts and status
     """
     try:
         logger.info(f"Getting K8s deployments: namespace={namespace}")
 
-        # Placeholder implementation
-        deployments = [
-            {
-                "name": "example-deployment",
-                "namespace": namespace,
-                "ready": "3/3",
-                "up_to_date": 3,
-                "available": 3,
-                "age": "15d",
-            }
-        ]
+        if not KUBERNETES_AVAILABLE:
+            return [{
+                "error": "kubernetes package not installed",
+                "name": "client-unavailable",
+                "message": "Install with: pip install kubernetes>=29.0.0"
+            }]
 
-        # TODO: Integrate with kubernetes client
+        k8s = get_k8s_client()
+
+        # Call the Kubernetes API
+        deployment_list = k8s.apps_api.list_namespaced_deployment(namespace=namespace)
+
+        # Convert deployments to dictionaries
+        deployments = [_deployment_to_dict(dep) for dep in deployment_list.items]
 
         logger.info(f"Found {len(deployments)} deployments")
         return deployments
+
+    except ApiException as e:
+        logger.error(f"Kubernetes API error getting deployments: {e.status} - {e.reason}")
+        error_msg = f"API error: {e.reason}"
+        if e.status == 404:
+            error_msg = f"Namespace '{namespace}' not found"
+        elif e.status == 403:
+            error_msg = f"Access denied to namespace '{namespace}'"
+        return [{"error": error_msg, "name": "api-error", "status_code": e.status}]
+
+    except RuntimeError as e:
+        logger.error(f"Kubernetes client error: {e}")
+        return [{"error": str(e), "name": "client-error"}]
 
     except Exception as e:
         logger.error(f"Failed to get deployments: {e}")
@@ -1413,33 +2780,87 @@ async def kubernetes_get_deployments_impl(namespace: str) -> List[Dict[str, Any]
 async def kubernetes_scale_impl(
     namespace: str, name: str, replicas: int
 ) -> Dict[str, Any]:
-    """Scale Kubernetes deployment.
+    """Scale a Kubernetes deployment using the Kubernetes API.
 
     Args:
         namespace: Kubernetes namespace
         name: Deployment name
-        replicas: Target replicas
+        replicas: Target number of replicas
 
     Returns:
-        Scaling result
+        Scaling result with status and updated replica count
     """
     try:
         logger.info(f"Scaling deployment: {namespace}/{name} to {replicas} replicas")
 
-        # Placeholder implementation
+        if not KUBERNETES_AVAILABLE:
+            return {
+                "namespace": namespace,
+                "deployment": name,
+                "status": "failed",
+                "error": "kubernetes package not installed",
+                "message": "Install with: pip install kubernetes>=29.0.0",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+
+        k8s = get_k8s_client()
+
+        # Create the scale patch body
+        scale_body = {"spec": {"replicas": replicas}}
+
+        # Patch the deployment scale
+        k8s.apps_api.patch_namespaced_deployment_scale(
+            name=name,
+            namespace=namespace,
+            body=scale_body
+        )
+
+        # Fetch the updated deployment to confirm
+        deployment = k8s.apps_api.read_namespaced_deployment(
+            name=name,
+            namespace=namespace
+        )
+
         result = {
             "namespace": namespace,
             "deployment": name,
-            "replicas": replicas,
+            "replicas": deployment.spec.replicas,
+            "ready_replicas": deployment.status.ready_replicas or 0,
             "status": "success",
             "message": f"Scaled to {replicas} replicas",
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-        # TODO: Integrate with kubernetes client
-
-        logger.info("Scaling complete")
+        logger.info(f"Scaling complete: {name} now has {replicas} replicas")
         return result
+
+    except ApiException as e:
+        logger.error(f"Kubernetes API error scaling deployment: {e.status} - {e.reason}")
+        error_msg = f"API error: {e.reason}"
+        if e.status == 404:
+            error_msg = f"Deployment '{name}' not found in namespace '{namespace}'"
+        elif e.status == 403:
+            error_msg = f"Access denied to scale deployment '{name}'"
+        elif e.status == 422:
+            error_msg = f"Invalid replica count: {replicas}"
+        return {
+            "namespace": namespace,
+            "deployment": name,
+            "status": "failed",
+            "error": error_msg,
+            "status_code": e.status,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    except RuntimeError as e:
+        logger.error(f"Kubernetes client error: {e}")
+        return {
+            "namespace": namespace,
+            "deployment": name,
+            "status": "failed",
+            "error": str(e),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
 
     except Exception as e:
         logger.error(f"Scaling failed: {e}")
@@ -1448,37 +2869,98 @@ async def kubernetes_scale_impl(
             "deployment": name,
             "status": "failed",
             "error": str(e),
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
 
 async def kubernetes_restart_impl(namespace: str, name: str) -> Dict[str, Any]:
-    """Restart Kubernetes deployment.
+    """Restart a Kubernetes deployment by patching the restart annotation.
+
+    This is equivalent to `kubectl rollout restart deployment/{name} -n {namespace}`.
+    It triggers a rolling restart by updating the pod template annotation.
 
     Args:
         namespace: Kubernetes namespace
         name: Deployment name
 
     Returns:
-        Restart result
+        Restart result with status
     """
     try:
         logger.info(f"Restarting deployment: {namespace}/{name}")
 
-        # Placeholder implementation
+        if not KUBERNETES_AVAILABLE:
+            return {
+                "namespace": namespace,
+                "deployment": name,
+                "status": "failed",
+                "error": "kubernetes package not installed",
+                "message": "Install with: pip install kubernetes>=29.0.0",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
+
+        k8s = get_k8s_client()
+
+        # Create the restart annotation patch
+        # This mimics `kubectl rollout restart` behavior
+        restart_time = datetime.now(timezone.utc).isoformat()
+        patch_body = {
+            "spec": {
+                "template": {
+                    "metadata": {
+                        "annotations": {
+                            "kubectl.kubernetes.io/restartedAt": restart_time
+                        }
+                    }
+                }
+            }
+        }
+
+        # Patch the deployment to trigger a rollout restart
+        deployment = k8s.apps_api.patch_namespaced_deployment(
+            name=name,
+            namespace=namespace,
+            body=patch_body
+        )
+
         result = {
             "namespace": namespace,
             "deployment": name,
             "status": "success",
             "message": "Rollout restart initiated",
-            "timestamp": datetime.now().isoformat(),
+            "restarted_at": restart_time,
+            "replicas": deployment.spec.replicas,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
-        # TODO: Integrate with kubernetes client
-        # kubectl rollout restart deployment/{name} -n {namespace}
-
-        logger.info("Restart initiated")
+        logger.info(f"Restart initiated for deployment: {name}")
         return result
+
+    except ApiException as e:
+        logger.error(f"Kubernetes API error restarting deployment: {e.status} - {e.reason}")
+        error_msg = f"API error: {e.reason}"
+        if e.status == 404:
+            error_msg = f"Deployment '{name}' not found in namespace '{namespace}'"
+        elif e.status == 403:
+            error_msg = f"Access denied to restart deployment '{name}'"
+        return {
+            "namespace": namespace,
+            "deployment": name,
+            "status": "failed",
+            "error": error_msg,
+            "status_code": e.status,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+
+    except RuntimeError as e:
+        logger.error(f"Kubernetes client error: {e}")
+        return {
+            "namespace": namespace,
+            "deployment": name,
+            "status": "failed",
+            "error": str(e),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
 
     except Exception as e:
         logger.error(f"Restart failed: {e}")
@@ -1487,51 +2969,33 @@ async def kubernetes_restart_impl(namespace: str, name: str) -> Dict[str, Any]:
             "deployment": name,
             "status": "failed",
             "error": str(e),
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
         }
 
 
 async def query_metrics_impl(promql: str, time_range: str) -> Dict[str, Any]:
-    """Query Prometheus metrics.
+    """Query Prometheus metrics using the Prometheus API.
 
     Args:
-        promql: PromQL query
-        time_range: Time range
+        promql: PromQL query string (e.g., 'rate(http_requests_total[5m])')
+        time_range: Time range (e.g., '1h', '30m', '1d', '2w')
 
     Returns:
-        Metric values
+        Metric values with time series data
     """
     try:
         logger.info(f"Querying metrics: {promql}, time_range={time_range}")
 
-        # Parse time range
-        now = datetime.now()
-        if time_range.endswith("h"):
-            start = now - timedelta(hours=int(time_range[:-1]))
-        elif time_range.endswith("m"):
-            start = now - timedelta(minutes=int(time_range[:-1]))
-        elif time_range.endswith("d"):
-            start = now - timedelta(days=int(time_range[:-1]))
+        # Get the Prometheus client and execute the query
+        client = get_prometheus_client()
+        result = await client.query_range(promql, time_range)
+
+        # Check for errors in the result
+        if "error" in result:
+            logger.warning(f"Prometheus query returned error: {result['error']}")
         else:
-            start = now - timedelta(hours=1)
+            logger.info(f"Query returned {len(result.get('result', []))} series")
 
-        # Placeholder implementation
-        result = {
-            "query": promql,
-            "start": start.isoformat(),
-            "end": now.isoformat(),
-            "resultType": "vector",
-            "result": [
-                {
-                    "metric": {"__name__": "http_requests_total", "job": "api"},
-                    "value": [now.timestamp(), "1234.5"],
-                }
-            ],
-        }
-
-        # TODO: Integrate with Prometheus API
-
-        logger.info(f"Query returned {len(result['result'])} series")
         return result
 
     except Exception as e:
@@ -1542,16 +3006,20 @@ async def query_metrics_impl(promql: str, time_range: str) -> Dict[str, Any]:
 async def search_logs_impl(
     query: str, service: Optional[str], level: Optional[str], time_range: str
 ) -> List[Dict[str, Any]]:
-    """Search logs.
+    """Search logs using the configured log backend (Loki or Elasticsearch).
+
+    The backend is determined by the LOG_BACKEND environment variable:
+    - 'loki': Query Grafana Loki using LogQL
+    - 'elasticsearch': Query Elasticsearch using full-text search
 
     Args:
-        query: Search query
-        service: Service filter
-        level: Log level filter
-        time_range: Time range
+        query: Search query or keyword to find in log messages
+        service: Service name filter (optional)
+        level: Log level filter: error, warn, info, debug (optional)
+        time_range: Time range to search (e.g., '1h', '30m', '1d')
 
     Returns:
-        Log entries
+        List of log entries with timestamp, service, level, message, and metadata
     """
     try:
         logger.info(
@@ -1559,20 +3027,35 @@ async def search_logs_impl(
             f"time_range={time_range}"
         )
 
-        # Placeholder implementation
-        logs = [
-            {
-                "timestamp": datetime.now().isoformat(),
-                "service": service or "api-server",
-                "level": level or "error",
-                "message": f"Log entry matching query: {query}",
-                "trace_id": "abc123",
-            }
-        ]
+        # Determine which backend to use
+        backend = get_log_backend()
+        logger.debug(f"Using log backend: {backend}")
 
-        # TODO: Integrate with log aggregation system (Elasticsearch, Loki)
+        if backend == "elasticsearch":
+            # Use Elasticsearch for log search
+            client = get_elasticsearch_client()
+            logs = await client.search(
+                query=query,
+                service=service,
+                level=level,
+                time_range=time_range,
+            )
+        else:
+            # Default to Loki for log search
+            client = get_loki_client()
+            logs = await client.query_range(
+                query=query,
+                service=service,
+                level=level,
+                time_range=time_range,
+            )
 
-        logger.info(f"Found {len(logs)} log entries")
+        # Check for errors in the result
+        if logs and "error" in logs[0]:
+            logger.warning(f"Log search returned error: {logs[0]['error']}")
+        else:
+            logger.info(f"Found {len(logs)} log entries")
+
         return logs
 
     except Exception as e:
@@ -1581,32 +3064,55 @@ async def search_logs_impl(
 
 
 async def list_alerts_impl(status: str) -> List[Dict[str, Any]]:
-    """List alerts from AlertManager.
+    """List alerts from Prometheus AlertManager API.
+
+    Queries the AlertManager API to retrieve current alerts filtered by status.
+    The AlertManager URL is configured via the ALERTMANAGER_URL environment variable.
 
     Args:
-        status: Alert status filter
+        status: Alert status filter:
+            - 'firing': Currently active alerts
+            - 'pending': Alerts waiting for threshold duration
+            - 'resolved': Recently resolved alerts
+            - 'all': All alerts regardless of status
 
     Returns:
-        List of alerts
+        List of alerts with name, severity, status, timestamps, labels, and annotations
     """
     try:
         logger.info(f"Listing alerts: status={status}")
 
-        # Placeholder implementation
-        alerts = [
-            {
-                "name": "HighMemoryUsage",
-                "severity": "warning",
-                "status": status,
-                "started_at": (datetime.now() - timedelta(minutes=15)).isoformat(),
-                "labels": {"service": "api", "env": "prod"},
-                "annotations": {"summary": "Memory usage above 80%"},
-            }
-        ]
+        # Get the AlertManager client and query alerts
+        client = get_alertmanager_client()
 
-        # TODO: Integrate with AlertManager API
+        # Map status to AlertManager query parameters
+        silenced = False
+        inhibited = False
+        active = True
 
-        logger.info(f"Found {len(alerts)} alerts")
+        if status == "resolved":
+            # For resolved alerts, we need to include inactive/silenced
+            active = False
+            silenced = True
+        elif status == "all":
+            # For all alerts, include everything
+            active = True
+            silenced = True
+            inhibited = True
+
+        alerts = await client.list_alerts(
+            status=status,
+            silenced=silenced,
+            inhibited=inhibited,
+            active=active,
+        )
+
+        # Check for errors in the result
+        if alerts and "error" in alerts[0]:
+            logger.warning(f"AlertManager query returned error: {alerts[0]['error']}")
+        else:
+            logger.info(f"Found {len(alerts)} alerts")
+
         return alerts
 
     except Exception as e:
@@ -1615,30 +3121,24 @@ async def list_alerts_impl(status: str) -> List[Dict[str, Any]]:
 
 
 async def documentation_search_impl(query: str, top_k: int) -> List[Dict[str, Any]]:
-    """Search internal documentation.
+    """Search internal documentation using RAG with Pinecone and Voyage embeddings.
+
+    Uses semantic search via the DevOpsKnowledgeBase for finding relevant
+    documentation across Kubernetes, Harness, Terraform, and internal runbooks.
+    Falls back to placeholder results if RAG is not configured.
 
     Args:
         query: Search query
         top_k: Number of results
 
     Returns:
-        Relevant documents
+        Relevant documents with content, score, and metadata
     """
     try:
         logger.info(f"Searching documentation: query='{query}', top_k={top_k}")
 
-        # Placeholder implementation
-        docs = [
-            {
-                "title": f"Documentation: {query}",
-                "content": f"Internal documentation for {query}. "
-                f"Includes setup, configuration, and troubleshooting.",
-                "url": f"https://docs.internal/{query.replace(' ', '-').lower()}",
-                "score": 0.95,
-            }
-        ]
-
-        # TODO: Integrate with Pinecone or vector database
+        # Use RAG-based search with Pinecone + Voyage embeddings
+        docs = await search_documentation_with_rag(query=query, top_k=top_k)
 
         logger.info(f"Found {len(docs)} documents")
         return docs
@@ -2226,6 +3726,16 @@ def get_devops_tools_by_category() -> Dict[str, List[StructuredTool]]:
 
 
 __all__ = [
+    # Harness Client
+    "HarnessClient",
+    "HarnessClientError",
+    "get_harness_client",
+    # Tavily Search Client
+    "TavilySearchClient",
+    "get_tavily_client",
+    # RAG Integration
+    "search_documentation_with_rag",
+    # Registry and convenience functions
     "DevOpsToolRegistry",
     "get_all_devops_tools",
     "get_tools_for_agent",
