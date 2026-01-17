@@ -112,12 +112,99 @@ class AgentRegistry:
         context["context_history"] = history
         return context
 
+    def build_prompt_profile(
+        self,
+        base_profile: Dict[str, Any],
+        failure_history: Sequence[Dict[str, Any]],
+        context_signals: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Build an adaptive prompt profile based on failures and context signals."""
+        instructions = list(base_profile.get("instructions", []))
+        constraints = list(base_profile.get("constraints", []))
+        examples = list(base_profile.get("examples", []))
+
+        def add_unique(target: List[str], value: str) -> None:
+            if value not in target:
+                target.append(value)
+
+        add_unique(
+            instructions,
+            "Follow the task requirements precisely and state any assumptions explicitly.",
+        )
+        add_unique(
+            constraints,
+            "Avoid speculative changes outside the provided context and requirements.",
+        )
+
+        if failure_history:
+            recent_failures = ", ".join(
+                entry.get("subagent", "unknown") for entry in failure_history[-3:]
+            )
+            add_unique(
+                instructions,
+                f"Address prior failure modes from recent subagents: {recent_failures}.",
+            )
+            add_unique(
+                constraints,
+                "Do not repeat previously failed approaches; call out the correction explicitly.",
+            )
+
+        risk_tags = context_signals.get("risk_tags", [])
+        if risk_tags:
+            add_unique(
+                instructions,
+                f"Mitigate known risk tags: {', '.join(risk_tags)}.",
+            )
+
+        if context_signals.get("needs_retry"):
+            add_unique(
+                instructions,
+                "Provide recovery steps and a verification checklist before final output.",
+            )
+            add_unique(
+                examples,
+                "Example: If 'missing_output' was flagged, include an explicit Output section.",
+            )
+
+        if context_signals.get("time_sensitive"):
+            add_unique(
+                constraints,
+                "Keep the response concise and prioritize the highest-impact actions.",
+            )
+
+        if context_signals.get("compliance_required"):
+            add_unique(
+                constraints,
+                "Include compliance considerations and cite relevant controls in the response.",
+            )
+
+        preferred_format = context_signals.get("preferred_format")
+        if preferred_format:
+            add_unique(
+                instructions,
+                f"Format the response as: {preferred_format}.",
+            )
+
+        return {
+            "instructions": instructions,
+            "constraints": constraints,
+            "examples": examples,
+        }
+
     def plan_invocations(
         self, requirements: TaskRequirements, context: Dict[str, Any], reason: str
     ) -> List[SubagentInvocation]:
         """Create invocation plans for matching subagents."""
         selected = self.select_for_task(requirements)
-        preserved = self.preserve_context(context, {"requirements": asdict(requirements)})
+        prompt_profile = self.build_prompt_profile(
+            context.get("prompt_profile", {}),
+            context.get("failure_history", []),
+            context.get("context_signals", {}),
+        )
+        preserved = self.preserve_context(
+            context,
+            {"requirements": asdict(requirements), "prompt_profile": prompt_profile},
+        )
         return [
             SubagentInvocation(name=spec.name, reason=reason, context=preserved)
             for spec in selected
