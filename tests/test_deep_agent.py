@@ -2,7 +2,7 @@
 
 import pytest
 from httpx import AsyncClient
-from httpx_mock import HTTPXMock
+from pytest_httpx import HTTPXMock
 
 from deep_agent import HarnessDeepAgent, AgentConfig
 
@@ -193,6 +193,41 @@ async def test_agent_with_custom_subagents(agent_config):
             task="test",
             context={}
         )
+
+    await agent.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_agent_with_empty_subagents(agent_config):
+    """Test agent with explicitly empty subagent list disables all subagents."""
+    agent_config.enabled_subagents = []
+    agent = HarnessDeepAgent(agent_config)
+
+    # No subagents should be registered
+    assert len(agent.registry.list_names()) == 0
+
+    # Should fail to delegate to any subagent
+    with pytest.raises(ValueError, match="is not enabled"):
+        await agent.delegate_to_subagent(
+            subagent="iac-golden-architect",
+            task="test",
+            context={}
+        )
+
+    await agent.client.aclose()
+
+
+@pytest.mark.asyncio
+async def test_agent_with_none_subagents(agent_config):
+    """Test agent with None uses default subagents."""
+    agent_config.enabled_subagents = None
+    agent = HarnessDeepAgent(agent_config)
+
+    # Default subagents should be registered
+    assert len(agent.registry.list_names()) == 3
+    assert "iac-golden-architect" in agent.registry.list_names()
+    assert "container-workflow" in agent.registry.list_names()
+    assert "team-accelerator" in agent.registry.list_names()
 
     await agent.client.aclose()
 
