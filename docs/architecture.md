@@ -149,6 +149,27 @@ The `AgentState` TypedDict maintains workflow context:
 }
 ```
 
+### Shared Memory Bus
+
+The shared memory bus provides a namespace-aware store for workflow context that can be
+persisted to in-memory or pluggable backends. It is designed for cross-node coordination
+without coupling node functions to a single storage mechanism.
+
+**Namespaces**
+- `workflow`: Routing decisions, orchestration metadata, and aggregated workflow context.
+- `agent`: Subagent outputs, task-level artifacts, and agent-local checkpoints.
+- `org`: Organization-scoped metadata, shared configuration, and cross-project context.
+
+**Access Patterns**
+- Workflow nodes (supervisors and orchestrators) write to the `workflow` namespace using
+  workflow-level access contexts.
+- Subagent nodes write results to the `agent` namespace using agent-level access contexts.
+- Organization-level integrations (e.g., persistent configuration or cross-workflow
+  state) require org-level access contexts to access the `org` namespace.
+
+The access context enforces namespace permissions at runtime, preventing workflow-only
+components from mutating organization-scoped memory.
+
 ## Integration Points
 
 ### Harness API Integration

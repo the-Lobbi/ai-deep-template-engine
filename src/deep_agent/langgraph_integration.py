@@ -10,6 +10,8 @@ from typing import Annotated, Any, Dict, List, Literal, TypedDict
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
 
+from .memory_bus import AccessContext, MemoryBus
+
 logger = logging.getLogger(__name__)
 
 
@@ -25,6 +27,7 @@ class AgentState(TypedDict):
         next_action: Next action to take in workflow
         supervisor_path: Ordered supervisors that handled routing
         routing_trace: Routing decisions for multi-level supervisors
+        memory_bus: Shared memory bus for workflow data
     """
 
     messages: Annotated[List[Dict[str, Any]], add_messages]
@@ -35,6 +38,17 @@ class AgentState(TypedDict):
     next_action: str
     supervisor_path: List[str]
     routing_trace: List[Dict[str, str]]
+    memory_bus: MemoryBus
+
+
+def get_memory_bus(state: AgentState) -> MemoryBus:
+    """Get or initialize the shared memory bus in workflow state."""
+    memory_bus = state.get("memory_bus")
+    if isinstance(memory_bus, MemoryBus):
+        return memory_bus
+    memory_bus = MemoryBus()
+    state["memory_bus"] = memory_bus
+    return memory_bus
 
 
 def record_supervisor_decision(state: AgentState, supervisor: str, decision: str) -> None:
@@ -65,6 +79,13 @@ def root_supervisor_node(state: AgentState) -> AgentState:
         state["next_action"] = "general_orchestration"
 
     record_supervisor_decision(state, "root_supervisor", state["next_action"])
+    memory_bus = get_memory_bus(state)
+    memory_bus.set(
+        "workflow",
+        "routing.root_supervisor",
+        {"task_type": task_type, "next_action": state["next_action"]},
+        access_context=AccessContext.for_workflow("root_supervisor"),
+    )
     logger.info("Root supervisor routing to: %s", state["next_action"])
     return state
 
@@ -89,6 +110,13 @@ def infra_supervisor_node(state: AgentState) -> AgentState:
         state["next_action"] = "end"
 
     record_supervisor_decision(state, "infra_supervisor", state["next_action"])
+    memory_bus = get_memory_bus(state)
+    memory_bus.set(
+        "workflow",
+        "routing.infra_supervisor",
+        {"task_type": task_type, "next_action": state["next_action"]},
+        access_context=AccessContext.for_workflow("infra_supervisor"),
+    )
     logger.info("Infra supervisor routing to: %s", state["next_action"])
     return state
 
@@ -117,6 +145,13 @@ def iac_architect_node(state: AgentState) -> AgentState:
     state.setdefault("subagent_results", {})
     state["subagent_results"]["iac"] = result
     state["next_action"] = "complete"
+    memory_bus = get_memory_bus(state)
+    memory_bus.set(
+        "agent",
+        "iac.result",
+        result,
+        access_context=AccessContext.for_agent("iac_architect"),
+    )
     return state
 
 
@@ -144,6 +179,13 @@ def container_workflow_node(state: AgentState) -> AgentState:
     state.setdefault("subagent_results", {})
     state["subagent_results"]["container"] = result
     state["next_action"] = "complete"
+    memory_bus = get_memory_bus(state)
+    memory_bus.set(
+        "agent",
+        "container.result",
+        result,
+        access_context=AccessContext.for_agent("container_workflow"),
+    )
     return state
 
 
@@ -171,6 +213,13 @@ def team_accelerator_node(state: AgentState) -> AgentState:
     state.setdefault("subagent_results", {})
     state["subagent_results"]["team"] = result
     state["next_action"] = "complete"
+    memory_bus = get_memory_bus(state)
+    memory_bus.set(
+        "agent",
+        "team.result",
+        result,
+        access_context=AccessContext.for_agent("team_accelerator"),
+    )
     return state
 
 
@@ -197,6 +246,13 @@ def general_orchestration_node(state: AgentState) -> AgentState:
     state.setdefault("subagent_results", {})
     state["subagent_results"]["orchestration"] = result
     state["next_action"] = "complete"
+    memory_bus = get_memory_bus(state)
+    memory_bus.set(
+        "workflow",
+        "orchestration.result",
+        result,
+        access_context=AccessContext.for_workflow("general_orchestration"),
+    )
     return state
 
 
@@ -211,6 +267,13 @@ def delivery_supervisor_node(state: AgentState) -> AgentState:
     """
     state["next_action"] = "team_accelerator"
     record_supervisor_decision(state, "delivery_supervisor", state["next_action"])
+    memory_bus = get_memory_bus(state)
+    memory_bus.set(
+        "workflow",
+        "routing.delivery_supervisor",
+        {"next_action": state["next_action"]},
+        access_context=AccessContext.for_workflow("delivery_supervisor"),
+    )
     logger.info("Delivery supervisor routing to: %s", state["next_action"])
     return state
 
