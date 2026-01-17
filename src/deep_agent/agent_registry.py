@@ -32,7 +32,9 @@ class SubagentSpec:
             return True
         required = set(requirements.capabilities)
         if not required:
-            return True
+            # No explicit capabilities requested and task not supported:
+            # treat this as a non-match rather than matching everything.
+            return False
         return required.issubset(set(self.capabilities))
 
     def match_score(self, requirements: TaskRequirements) -> int:
