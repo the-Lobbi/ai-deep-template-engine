@@ -101,8 +101,12 @@ class AgentRegistry:
         """Return a new context preserving existing data with a history trail."""
         context = {**base_context}
         history = list(context.get("context_history", []))
-        history.append(updates)
-        context.update(updates)
+        # Avoid allowing callers to override or corrupt the history field directly.
+        # We strip out any 'context_history' key from updates before recording it in
+        # the history trail and applying it to the new context.
+        filtered_updates = {k: v for k, v in updates.items() if k != "context_history"}
+        history.append(filtered_updates)
+        context.update(filtered_updates)
         context["context_history"] = history
         return context
 
