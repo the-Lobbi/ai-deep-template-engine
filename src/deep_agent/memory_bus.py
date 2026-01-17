@@ -1,31 +1,34 @@
-"""Shared memory bus for Deep Agent workflows."""
+"""Shared memory bus with namespace-aware access control."""
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import Any, Dict, FrozenSet, Iterable, Literal, Optional, Protocol
+from dataclasses import dataclass, field
+from typing import Any, Dict, List, Literal, Optional, Protocol
 
 MemoryNamespace = Literal["workflow", "agent", "org"]
 
 
 class MemoryBackend(Protocol):
-    """Backend interface for memory persistence."""
+    """Backend interface for the shared memory bus."""
 
-    def get(self, namespace: MemoryNamespace, key: str) -> Any:
-        """Return the value stored for a namespace/key."""
+    def get(self, namespace: MemoryNamespace, key: str) -> Any | None:
+        """Return a stored value or None if missing."""
 
     def set(self, namespace: MemoryNamespace, key: str, value: Any) -> None:
-        """Store a value for a namespace/key."""
+        """Persist a value in the backend."""
 
     def delete(self, namespace: MemoryNamespace, key: str) -> None:
-        """Delete a value for a namespace/key."""
+        """Remove a key from the backend."""
 
-    def list(self, namespace: MemoryNamespace) -> Dict[str, Any]:
-        """List all values in a namespace."""
+    def list_keys(self, namespace: MemoryNamespace, prefix: Optional[str] = None) -> List[str]:
+        """List keys in a namespace, optionally filtered by prefix."""
+
+    def clear(self, namespace: MemoryNamespace) -> None:
+        """Remove all keys for a namespace."""
 
 
 class InMemoryMemoryBackend:
-    """In-memory backend for memory persistence."""
+    """In-memory implementation of the memory backend."""
 
     def __init__(self) -> None:
         self._store: Dict[MemoryNamespace, Dict[str, Any]] = {
@@ -34,7 +37,7 @@ class InMemoryMemoryBackend:
             "org": {},
         }
 
-    def get(self, namespace: MemoryNamespace, key: str) -> Any:
+    def get(self, namespace: MemoryNamespace, key: str) -> Any | None:
         return self._store[namespace].get(key)
 
     def set(self, namespace: MemoryNamespace, key: str, value: Any) -> None:
@@ -43,20 +46,21 @@ class InMemoryMemoryBackend:
     def delete(self, namespace: MemoryNamespace, key: str) -> None:
         self._store[namespace].pop(key, None)
 
-    def list(self, namespace: MemoryNamespace) -> Dict[str, Any]:
-        return dict(self._store[namespace])
+    def list_keys(self, namespace: MemoryNamespace, prefix: Optional[str] = None) -> List[str]:
+        if prefix is None:
+            return sorted(self._store[namespace].keys())
+        return sorted(key for key in self._store[namespace] if key.startswith(prefix))
 
-
-class MemoryAccessError(PermissionError):
-    """Raised when a caller lacks access to a namespace."""
+    def clear(self, namespace: MemoryNamespace) -> None:
+        self._store[namespace].clear()
 
 
 @dataclass(frozen=True)
 class AccessContext:
-    """Access context for memory operations."""
+    """Access context for memory bus operations."""
 
     actor: str
-    allowed_namespaces: FrozenSet[MemoryNamespace]
+    allowed_namespaces: frozenset[MemoryNamespace] = field(default_factory=frozenset)
 
     @classmethod
     def for_workflow(cls, actor: str) -> "AccessContext":
@@ -64,7 +68,7 @@ class AccessContext:
 
     @classmethod
     def for_agent(cls, actor: str) -> "AccessContext":
-        return cls(actor=actor, allowed_namespaces=frozenset({"workflow", "agent"}))
+        return cls(actor=actor, allowed_namespaces=frozenset({"agent"}))
 
     @classmethod
     def for_org(cls, actor: str) -> "AccessContext":
@@ -75,25 +79,19 @@ class AccessContext:
 
 
 class MemoryBus:
-    """Shared memory bus with namespace isolation and access checks."""
+    """Namespace-aware shared memory bus with access checks."""
 
     def __init__(self, backend: Optional[MemoryBackend] = None) -> None:
         self._backend = backend or InMemoryMemoryBackend()
 
-    @property
-    def backend(self) -> MemoryBackend:
-        return self._backend
-
-    def _check_access(self, namespace: MemoryNamespace, access_context: AccessContext) -> None:
-        if not access_context.allows(namespace):
-            raise MemoryAccessError(
-                f"Actor '{access_context.actor}' cannot access '{namespace}' namespace."
-            )
-
     def get(
-        self, namespace: MemoryNamespace, key: str, access_context: AccessContext
-    ) -> Any:
-        self._check_access(namespace, access_context)
+        self,
+        namespace: MemoryNamespace,
+        key: str,
+        *,
+        access_context: AccessContext,
+    ) -> Any | None:
+        self._require_access(namespace, access_context)
         return self._backend.get(namespace, key)
 
     def set(
@@ -101,30 +99,39 @@ class MemoryBus:
         namespace: MemoryNamespace,
         key: str,
         value: Any,
+        *,
         access_context: AccessContext,
     ) -> None:
-        self._check_access(namespace, access_context)
+        self._require_access(namespace, access_context)
         self._backend.set(namespace, key, value)
 
-    def delete(self, namespace: MemoryNamespace, key: str, access_context: AccessContext) -> None:
-        self._check_access(namespace, access_context)
-        self._backend.delete(namespace, key)
-
-    def list(
-        self, namespace: MemoryNamespace, access_context: AccessContext
-    ) -> Dict[str, Any]:
-        self._check_access(namespace, access_context)
-        return self._backend.list(namespace)
-
-    def merge(
+    def delete(
         self,
         namespace: MemoryNamespace,
-        values: Dict[str, Any],
+        key: str,
+        *,
         access_context: AccessContext,
     ) -> None:
-        self._check_access(namespace, access_context)
-        for key, value in values.items():
-            self._backend.set(namespace, key, value)
+        self._require_access(namespace, access_context)
+        self._backend.delete(namespace, key)
 
-    def allowed_namespaces(self, access_context: AccessContext) -> Iterable[MemoryNamespace]:
-        return access_context.allowed_namespaces
+    def list_keys(
+        self,
+        namespace: MemoryNamespace,
+        *,
+        access_context: AccessContext,
+        prefix: Optional[str] = None,
+    ) -> List[str]:
+        self._require_access(namespace, access_context)
+        return self._backend.list_keys(namespace, prefix=prefix)
+
+    def clear(self, namespace: MemoryNamespace, *, access_context: AccessContext) -> None:
+        self._require_access(namespace, access_context)
+        self._backend.clear(namespace)
+
+    @staticmethod
+    def _require_access(namespace: MemoryNamespace, access_context: AccessContext) -> None:
+        if not access_context.allows(namespace):
+            raise PermissionError(
+                f"Access denied for namespace '{namespace}' by actor '{access_context.actor}'."
+            )
