@@ -34,6 +34,7 @@ class AgentConfig:
     mcp_server_host: str = "0.0.0.0"
     mcp_server_port: int = 8000
     log_level: str = "INFO"
+    memory_backend: Optional[MemoryBackend] = None
 
 
 class HarnessDeepAgent:
@@ -65,6 +66,8 @@ class HarnessDeepAgent:
             },
             timeout=30.0,
         )
+        self.memory_bus = MemoryBus(config.memory_backend or InMemoryMemoryBackend())
+        self.memory_access = AccessContext.for_agent("harness_deep_agent")
         logging.basicConfig(level=config.log_level)
         logger.info(
             "Initialized HarnessDeepAgent with subagents: %s",
@@ -232,6 +235,13 @@ class HarnessDeepAgent:
             raise ValueError(f"Subagent '{subagent}' is not enabled")
 
         logger.info(f"Delegating to {subagent}: {task}")
+
+        self.memory_bus.set(
+            "workflow",
+            f"task:{subagent}",
+            {"task": task, "context": context},
+            access_context=self.memory_access,
+        )
 
         # This is a placeholder for actual subagent delegation
         # In production, this would route to LangGraph workflow nodes

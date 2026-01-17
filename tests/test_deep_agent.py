@@ -4,7 +4,7 @@ import pytest
 from httpx import AsyncClient
 from pytest_httpx import HTTPXMock
 
-from deep_agent import HarnessDeepAgent, AgentConfig
+from deep_agent import HarnessDeepAgent, AgentConfig, create_agent_workflow
 
 
 @pytest.fixture
