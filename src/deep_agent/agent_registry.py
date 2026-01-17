@@ -11,7 +11,7 @@ class TaskRequirements:
     """Describe what a task needs from subagents."""
 
     task: str
-    capabilities: Sequence[str] = field(default_factory=list)
+    capabilities: Sequence[str] = field(default_factory=tuple)
     allow_team: bool = True
     priority: str = "normal"
 
