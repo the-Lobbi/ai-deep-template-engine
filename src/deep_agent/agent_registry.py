@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence
+from dataclasses import asdict, dataclass, field
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 
 @dataclass(frozen=True)
@@ -11,7 +11,7 @@ class TaskRequirements:
     """Describe what a task needs from subagents."""
 
     task: str
-    capabilities: Sequence[str] = field(default_factory=list)
+    capabilities: Sequence[str] = field(default_factory=tuple)
     allow_team: bool = True
     priority: str = "normal"
 
@@ -32,7 +32,9 @@ class SubagentSpec:
             return True
         required = set(requirements.capabilities)
         if not required:
-            return True
+            # No explicit capabilities requested and task not supported:
+            # treat this as a non-match rather than matching everything.
+            return False
         return required.issubset(set(self.capabilities))
 
     def match_score(self, requirements: TaskRequirements) -> int:
@@ -101,8 +103,12 @@ class AgentRegistry:
         """Return a new context preserving existing data with a history trail."""
         context = {**base_context}
         history = list(context.get("context_history", []))
-        history.append(updates)
-        context.update(updates)
+        # Avoid allowing callers to override or corrupt the history field directly.
+        # We strip out any 'context_history' key from updates before recording it in
+        # the history trail and applying it to the new context.
+        filtered_updates = {k: v for k, v in updates.items() if k != "context_history"}
+        history.append(filtered_updates)
+        context.update(filtered_updates)
         context["context_history"] = history
         return context
 
@@ -111,7 +117,7 @@ class AgentRegistry:
     ) -> List[SubagentInvocation]:
         """Create invocation plans for matching subagents."""
         selected = self.select_for_task(requirements)
-        preserved = self.preserve_context(context, {"requirements": requirements})
+        preserved = self.preserve_context(context, {"requirements": asdict(requirements)})
         return [
             SubagentInvocation(name=spec.name, reason=reason, context=preserved)
             for spec in selected
