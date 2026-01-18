@@ -3,7 +3,7 @@
 A LangGraph-powered MCP server for infrastructure orchestration with autonomous subagents.
 """
 
-__version__ = "0.1.0"
+from .version import __version__
 
 from .agent_registry import AgentRegistry, SubagentSpec, TaskRequirements
 from .harness_deep_agent import HarnessDeepAgent, AgentConfig

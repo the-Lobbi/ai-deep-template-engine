@@ -10,7 +10,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from . import __version__
+from .version import __version__
 from .harness_deep_agent import AgentConfig, HarnessDeepAgent
 
 logger = logging.getLogger(__name__)
