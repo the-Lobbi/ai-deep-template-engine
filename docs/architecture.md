@@ -210,6 +210,9 @@ Deep Agent MCP Server (port 8000)
    Harness APIs
 ```
 
+The MCP server host/port are configured through `AgentConfig.mcp_server_host` and
+`AgentConfig.mcp_server_port`, consumed by the CLI runner (`python -m deep_agent.mcp_runner`).
+
 ### Kubernetes Deployment
 
 Runs as a Kubernetes deployment with:

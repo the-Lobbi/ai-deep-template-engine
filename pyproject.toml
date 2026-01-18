@@ -63,6 +63,9 @@ Repository = "https://github.com/the-Lobbi/ai-deep-template-engine"
 Documentation = "https://github.com/the-Lobbi/ai-deep-template-engine/tree/main/docs"
 "Bug Reports" = "https://github.com/the-Lobbi/ai-deep-template-engine/issues"
 
+[project.scripts]
+deep-agent-mcp = "deep_agent.mcp_runner:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
 include = ["deep_agent*"]
