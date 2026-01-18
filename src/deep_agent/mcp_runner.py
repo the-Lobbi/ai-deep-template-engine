@@ -28,7 +28,19 @@ def build_agent_config(args: argparse.Namespace) -> AgentConfig:
     )
     log_level = args.log_level or _get_env_var("DEEP_AGENT_LOG_LEVEL") or "INFO"
     mcp_server_host = args.mcp_server_host or _get_env_var("MCP_SERVER_HOST") or "0.0.0.0"
-    mcp_server_port = args.mcp_server_port or int(_get_env_var("MCP_SERVER_PORT") or 8000)
+    
+    # Handle port conversion with error handling
+    if args.mcp_server_port is not None:
+        mcp_server_port = args.mcp_server_port
+    else:
+        port_env = _get_env_var("MCP_SERVER_PORT")
+        if port_env:
+            try:
+                mcp_server_port = int(port_env)
+            except ValueError:
+                raise ValueError(f"MCP_SERVER_PORT must be a valid integer, got: {port_env}")
+        else:
+            mcp_server_port = 8000
 
     if not harness_account_id:
         raise ValueError("HARNESS_ACCOUNT_ID is required (via --harness-account-id or env)")
