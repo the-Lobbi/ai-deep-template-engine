@@ -213,7 +213,7 @@ Deep Agent MCP Server (port 8000)
 To start the MCP server locally, run:
 
 ```bash
-python -m deep_agent.cli \
+python -m deep_agent.mcp_runner \
   --harness-account-id "<account>" \
   --harness-api-url "https://app.harness.io/gateway" \
   --harness-api-token "<token>" \
