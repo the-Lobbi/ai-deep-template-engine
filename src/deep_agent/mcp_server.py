@@ -74,15 +74,19 @@ def create_mcp_app(config: AgentConfig) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        agent = HarnessDeepAgent(config)
-        app.state.agent = agent
-        logger.info(
-            "Starting MCP server for HarnessDeepAgent on %s:%s",
-            config.mcp_server_host,
-            config.mcp_server_port,
-        )
-        yield
-        await agent.client.aclose()
+        agent: Optional[HarnessDeepAgent] = None
+        try:
+            agent = HarnessDeepAgent(config)
+            app.state.agent = agent
+            logger.info(
+                "Starting MCP server for HarnessDeepAgent on %s:%s",
+                config.mcp_server_host,
+                config.mcp_server_port,
+            )
+            yield
+        finally:
+            if agent is not None:
+                await agent.client.aclose()
 
     app = FastAPI(title="Harness Deep Agent MCP Server", lifespan=lifespan)
 
