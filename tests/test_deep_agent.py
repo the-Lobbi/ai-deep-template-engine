@@ -1,6 +1,7 @@
 """Tests for Deep Agent Harness Automation System."""
 
 import pytest
+from langgraph.checkpoint.memory import MemorySaver
 from httpx import AsyncClient
 from pytest_httpx import HTTPXMock
 
@@ -253,3 +254,11 @@ def test_plan_hooks(agent_config):
         assert edge_plan
         assert node_plan[0].context["request_id"] == "123"
         assert edge_plan[0].context["request_id"] == "456"
+
+
+def test_create_agent_workflow_with_dedicated_checkpointer():
+    """Ensure workflows can be created with a dedicated checkpointer."""
+    checkpointer = MemorySaver()
+    workflow = create_agent_workflow(checkpointer=checkpointer)
+
+    assert workflow is not None

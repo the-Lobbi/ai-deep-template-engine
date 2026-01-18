@@ -6,11 +6,12 @@ specialized subagents in infrastructure automation tasks.
 
 import copy
 import logging
+from functools import partial
 from datetime import datetime, timezone
-from typing import Annotated, Any, Dict, List, Literal, TypedDict
+from typing import Annotated, Any, Dict, List, Literal, Optional, TypedDict
 from uuid import uuid4
 
-from langgraph.checkpoint.base import create_checkpoint, empty_checkpoint
+from langgraph.checkpoint.base import BaseCheckpointSaver, create_checkpoint, empty_checkpoint
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 from langgraph.graph.message import add_messages
@@ -18,7 +19,6 @@ from langgraph.graph.message import add_messages
 from .memory_bus import AccessContext, MemoryBus
 
 logger = logging.getLogger(__name__)
-CHECKPOINTER = MemorySaver()
 
 
 class AgentState(TypedDict):
@@ -436,7 +436,10 @@ def reflection_node(state: AgentState) -> AgentState:
     return state
 
 
-def fork_candidates_node(state: AgentState) -> AgentState:
+def fork_candidates_node(
+    state: AgentState,
+    checkpointer: BaseCheckpointSaver,
+) -> AgentState:
     """Fork state into candidate variants and checkpoint each branch."""
     logger.info("Forking state into candidate variants via checkpoints")
     results = state.get("subagent_results", {})
@@ -453,7 +456,7 @@ def fork_candidates_node(state: AgentState) -> AgentState:
             "candidate_name": candidate["name"],
             "candidate_index": index,
         }
-        CHECKPOINTER.put({"configurable": {"checkpoint_id": checkpoint_id}}, checkpoint, metadata, {})
+        checkpointer.put({"configurable": {"checkpoint_id": checkpoint_id}}, checkpoint, metadata, {})
         fork_checkpoint_ids.append(checkpoint_id)
 
     state["candidate_results"] = candidate_results
@@ -650,12 +653,18 @@ def create_delivery_subgraph() -> StateGraph:
     return delivery_graph.compile()
 
 
-def create_agent_workflow() -> StateGraph:
+def create_agent_workflow(
+    checkpointer: Optional[BaseCheckpointSaver] = None,
+) -> StateGraph:
     """Create the LangGraph workflow for the Deep Agent.
+
+    Args:
+        checkpointer: Optional checkpoint saver (defaults to a new MemorySaver).
 
     Returns:
         Compiled workflow graph
     """
+    workflow_checkpointer = checkpointer or MemorySaver()
     workflow = StateGraph(AgentState)
 
     # Add nodes
@@ -663,7 +672,10 @@ def create_agent_workflow() -> StateGraph:
     workflow.add_node("infra_supervisor", create_infra_subgraph())
     workflow.add_node("delivery_supervisor", create_delivery_subgraph())
     workflow.add_node("general_orchestration", general_orchestration_node)
-    workflow.add_node("fork_candidates", fork_candidates_node)
+    workflow.add_node(
+        "fork_candidates",
+        partial(fork_candidates_node, checkpointer=workflow_checkpointer),
+    )
     workflow.add_node("merge_candidates", merge_candidates_node)
     workflow.add_node("reflection", reflection_node)
 
@@ -713,4 +725,4 @@ def create_agent_workflow() -> StateGraph:
         },
     )
 
-    return workflow.compile(checkpointer=CHECKPOINTER)
+    return workflow.compile(checkpointer=workflow_checkpointer)
