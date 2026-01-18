@@ -48,6 +48,14 @@ HARNESS_API_URL=https://app.harness.io/gateway
 HARNESS_API_TOKEN=your_api_token
 HARNESS_ORG_IDENTIFIER=default
 HARNESS_PROJECT_IDENTIFIER=your_project
+MCP_SERVER_HOST=0.0.0.0
+MCP_SERVER_PORT=8000
+```
+
+Run the MCP server (consumes `MCP_SERVER_HOST`/`MCP_SERVER_PORT` via `AgentConfig`):
+
+```bash
+python -m deep_agent.mcp_runner
 ```
 
 ## Development
